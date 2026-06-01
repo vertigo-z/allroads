@@ -35,7 +35,7 @@ struct Feature {
 }
 
 fn default_status() -> String { "Planned".into() }
-fn default_color() -> String { "#2196F3".into() }
+fn default_color() -> String { "#FF9800".into() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Quarter {
@@ -86,7 +86,7 @@ impl Default for FeatureDialogState {
             title: String::new(),
             description: String::new(),
             status: "Planned".into(),
-            color: "#2196F3".into(),
+            color: default_color(),
         }
     }
 }
@@ -122,9 +122,32 @@ impl FeatureDialogState {
             });
             ui.add_space(4.0);
 
-            ui.label("Color (hex):");
+            ui.label("Color:");
             ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.color);
+                let colors = [
+                    ("#F44336", egui::Color32::from_rgb(244, 67, 54)),   // Red
+                    ("#FF9800", egui::Color32::from_rgb(255, 152, 0)),   // Orange
+                    ("#FFEB3B", egui::Color32::from_rgb(255, 235, 59)),  // Yellow
+                    ("#4CAF50", egui::Color32::from_rgb(76, 175, 80)),   // Green
+                    ("#2196F3", egui::Color32::from_rgb(33, 150, 243)),  // Blue
+                    ("#9C27B0", egui::Color32::from_rgb(156, 39, 176)),  // Purple
+                    ("#E91E63", egui::Color32::from_rgb(233, 30, 99)),   // Pink
+                    ("#00BCD4", egui::Color32::from_rgb(0, 188, 212)),   // Cyan
+                ];
+                for (hex, egui_color) in &colors {
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(20.0, 20.0),
+                        egui::Sense::click(),
+                    );
+                    ui.painter().rect_filled(rect, 2.0, *egui_color);
+                    if self.color == *hex {
+                        ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                    }
+                    if response.clicked() {
+                        self.color = hex.to_string();
+                    }
+                    ui.add_space(4.0);
+                }
             });
             ui.add_space(8.0);
 
@@ -219,9 +242,10 @@ impl RoadmapApp {
         self.status_text = format!("Added Q{} {}", quarter, year);
     }
 
-    fn remove_quarter(&mut self) {
-        if self.quarters.pop().is_some() {
-            self.status_text = "Removed last quarter".into();
+    fn remove_quarter(&mut self, index: usize) {
+        if index < self.quarters.len() {
+            let removed = self.quarters.remove(index);
+            self.status_text = format!("Removed {}", removed.name());
         }
     }
 
@@ -367,7 +391,6 @@ impl eframe::App for RoadmapApp {
                 ui.heading("Timeline");
                 ui.add_space(10.0);
                 if ui.button("Add Quarter").clicked() { self.add_quarter(); }
-                if ui.button("Remove Quarter").clicked() { self.remove_quarter(); }
                 if ui.button("Clear All").clicked() { self.clear_all(); }
             });
         });
@@ -378,13 +401,21 @@ impl eframe::App for RoadmapApp {
                 let mut remove_action: Option<(usize, usize)> = None;
                 let mut move_up_action: Option<(usize, usize)> = None;
                 let mut move_down_action: Option<(usize, usize)> = None;
+                let mut quarter_remove_idx: Option<usize> = None;
 
                 for (qi, quarter) in &mut self.quarters.iter_mut().enumerate() {
                     egui::Frame::group(ui.style())
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 180)))
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
-                                ui.heading(quarter.name());
+                                ui.horizontal(|ui| {
+                                    ui.heading(quarter.name());
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("x").clicked() {
+                                            quarter_remove_idx = Some(qi);
+                                        }
+                                    });
+                                });
                                 ui.label(quarter.date_range());
                                 ui.separator();
 
@@ -417,7 +448,7 @@ impl eframe::App for RoadmapApp {
                                                 }
 
                                                 let status_color = if feature.completed {
-                                                    egui::Color32::GREEN
+                                                    egui::Color32::from_rgb(76, 175, 80)
                                                 } else {
                                                     egui::Color32::from_rgb(100, 100, 100)
                                                 };
@@ -429,10 +460,10 @@ impl eframe::App for RoadmapApp {
                                                 ui.colored_label(egui::Color32::GRAY, &feature.description);
 
                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    if ui.small_button("\u{2193}").clicked() {
+                                                    if ui.small_button("Down").clicked() {
                                                         move_down_action = Some((qi, fi));
                                                     }
-                                                    if ui.small_button("\u{2191}").clicked() {
+                                                    if ui.small_button("Up").clicked() {
                                                         move_up_action = Some((qi, fi));
                                                     }
                                                     if ui.small_button("Delete").clicked() {
@@ -449,6 +480,10 @@ impl eframe::App for RoadmapApp {
                             });
                         });
                     ui.add_space(8.0);
+                }
+
+                if let Some(qi) = quarter_remove_idx {
+                    self.remove_quarter(qi);
                 }
 
                 if let Some((qi, fi)) = remove_action {
