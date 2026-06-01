@@ -14,3 +14,8 @@ features:
 - move tasks up and down, and between quarters
 - saved in .json format
 - completely redone, clean, rust based ui
+
+compiling:
+```
+cd allroads && cargo build --release
+```
