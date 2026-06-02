@@ -1,4 +1,6 @@
 <img align="center" width="100%" height="100%" src="img/allroads.png" alt="allroads interface">
+<img align="center" width="100%" height="100%" src="img/allroads_white.png" alt="allroads light mode">
+
 
 ---
 <p>allroads</p>
