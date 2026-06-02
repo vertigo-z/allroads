@@ -1013,7 +1013,11 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 700.0])
             .with_title("allroads v1.1")
-            .with_decorations(false),
+            .with_decorations(false)
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../icon.icns"))
+                    .unwrap_or_default(),
+            ),
         ..Default::default()
     };
     eframe::run_native(
