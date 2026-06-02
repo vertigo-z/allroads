@@ -23,7 +23,7 @@ strip = true
 [package.metadata.bundle]
 name = "allroads"
 identifier = "com.allroads.app"
-icon = ["icon.icns"]
+icon = ["icon.png"]
 version = "1.1.0"
 category = "Productivity"
 short_description = "roadmap planning tool"
