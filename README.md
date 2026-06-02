@@ -16,7 +16,6 @@ latest working version.
 - unified sqlite3 roadmap storage with optional AES database encryption
 - option to store database encryption key in keychain
 - move tasks up and down, and between quarters
-- saved in .json format
 - completely redone, clean, rust based ui
 
 ### coming soon:
