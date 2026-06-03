@@ -1,5 +1,5 @@
 <img align="center" width="100%" height="100%" src="img/allroads.png" alt="allroads interface">
-<img align="center" width="100%" height="100%" src="img/allroads_white.png" alt="allroads light mode">
+<img align="center" width="100%" height="100%" src="img/timeline.png" alt="allroads light mode">
 
 
 ---
@@ -12,6 +12,7 @@ latest working version.
 ### features:
 - quarterly roadmap tracking. add and remove quarters as needed
 - color coded tasks/features with descriptions
+- new timeline view to help visualize project
 - 4 stages of development (planned, developing, testing, and completed)
 - unified sqlite3 roadmap storage with optional AES database encryption
 - option to store database encryption key in keychain
@@ -22,7 +23,6 @@ latest working version.
 - **time management and statistics:**
   - record expected and actual task length
   - record actual start/end date of tasks
-  - new timeline view to help visualize project
   - keep, view, and graph productivity stats
 
 - **synchronization and organizations:**
