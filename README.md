@@ -32,6 +32,7 @@ latest working version.
   - enable LLM interaction with allroads
   - AIs will be able to join organizations
   - assign tasks to agents and view outcomes
+  - agents can be assigned "leader" role and manage a human team
 
 ### compiling:
 ```
