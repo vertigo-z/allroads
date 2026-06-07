@@ -13,8 +13,11 @@ latest working version.
 ### features:
 - quarterly roadmap tracking. add and remove quarters as needed
 - color coded tasks/features with descriptions
-- new timeline view to help visualize project
+- timeline view to help visualize project
 - 4 stages of development (planned, developing, testing, and completed)
+- new org chart view to visualize organizations and task assignment
+  - hierarchical view (only leaders can assign to subordinates)
+  - non-hierarchical view (anyone can assign tasks to anyone)
 - unified sqlite3 roadmap storage with optional AES database encryption
 - option to store database encryption key in keychain
 - move tasks up and down, and between quarters
@@ -24,10 +27,11 @@ latest working version.
 - **statistics:**
   - keep, view, and graph productivity stats
 
-- **synchronization and organizations:**
-  - build/join organizational charts
-  - assign tasks to users 
-  - uses simple token-based access
+- **org synchronization:**
+  - join organizational charts and sync between team members
+  - assign tasks and be assigned tasks
+  - collaborate and track large-scale team projects
+  - use simple token-based access
 
 - **model context protocol:**
   - enable LLM interaction with allroads
