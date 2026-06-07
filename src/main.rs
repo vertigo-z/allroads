@@ -67,6 +67,47 @@ CREATE TABLE IF NOT EXISTS feature (
     paused_at TEXT,
     completed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS org (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    owner_token TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS org_settings (
+    org_id INTEGER PRIMARY KEY REFERENCES org(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL DEFAULT 'hierarchy',
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS org_user (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES org(id) ON DELETE CASCADE,
+    display_name TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'member',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS org_owner (
+    org_id INTEGER PRIMARY KEY REFERENCES org(id) ON DELETE CASCADE,
+    owner_user_id INTEGER NOT NULL REFERENCES org_user(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS org_chart (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES org(id) ON DELETE CASCADE,
+    manager_id INTEGER NOT NULL REFERENCES org_user(id) ON DELETE CASCADE,
+    report_id INTEGER NOT NULL REFERENCES org_user(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS org_chart_unique_link ON org_chart(org_id, manager_id, report_id);
+CREATE TABLE IF NOT EXISTS task_assignment (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature_id TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES org_user(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'Assigned',
+    assigned_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 ";
 
 fn db_path() -> std::path::PathBuf {
@@ -158,6 +199,16 @@ fn open_connection_at_path(path: &std::path::PathBuf, encrypted: bool, use_keych
     conn.execute_batch("ALTER TABLE feature ADD COLUMN paused_at TEXT").ok();
     conn.execute_batch("ALTER TABLE feature ADD COLUMN completed_at TEXT").ok();
     conn.execute_batch("ALTER TABLE feature ADD COLUMN start_date TEXT").ok();
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS org (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, owner_token TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)").ok();
+    conn.execute_batch("ALTER TABLE org ADD COLUMN owner_token TEXT NOT NULL DEFAULT ''").ok();
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS org_settings (org_id INTEGER PRIMARY KEY REFERENCES org(id) ON DELETE CASCADE, mode TEXT NOT NULL DEFAULT 'hierarchy', updated_at TEXT NOT NULL)").ok();
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS org_user (id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL REFERENCES org(id) ON DELETE CASCADE, display_name TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)").ok();
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS org_owner (org_id INTEGER PRIMARY KEY REFERENCES org(id) ON DELETE CASCADE, owner_user_id INTEGER NOT NULL REFERENCES org_user(id) ON DELETE CASCADE, created_at TEXT NOT NULL)").ok();
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS org_chart (id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL REFERENCES org(id) ON DELETE CASCADE, manager_id INTEGER NOT NULL REFERENCES org_user(id) ON DELETE CASCADE, report_id INTEGER NOT NULL REFERENCES org_user(id) ON DELETE CASCADE, created_at TEXT NOT NULL)").ok();
+    conn.execute_batch("DELETE FROM org_chart WHERE id NOT IN (SELECT MIN(id) FROM org_chart GROUP BY org_id, manager_id, report_id)").ok();
+    conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS org_chart_unique_link ON org_chart(org_id, manager_id, report_id)").ok();
+    conn.execute_batch("UPDATE org_user SET role = 'lead' WHERE role = 'member' AND id IN (SELECT DISTINCT manager_id FROM org_chart)").ok();
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS task_assignment (id INTEGER PRIMARY KEY AUTOINCREMENT, feature_id TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES org_user(id) ON DELETE CASCADE, status TEXT NOT NULL DEFAULT 'Assigned', assigned_at TEXT NOT NULL, updated_at TEXT NOT NULL)").ok();
     Ok((conn, db_key))
 }
 
@@ -238,6 +289,234 @@ fn db_load_roadmap(conn: &Connection, roadmap_id: i64) -> Vec<Quarter> {
     quarters
 }
 
+fn db_list_orgs(conn: &Connection) -> Vec<Org> {
+    let mut stmt = conn.prepare("SELECT id, name FROM org ORDER BY updated_at DESC").unwrap();
+    let rows = stmt.query_map([], |row| {
+        Ok(Org {
+            id: row.get(0)?,
+            name: row.get(1)?,
+        })
+    }).unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+fn db_create_org(conn: &Connection, name: &str) -> i64 {
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO org (name, owner_token, created_at, updated_at) VALUES (?1, '', ?2, ?3)",
+        rusqlite::params![name, now, now],
+    ).unwrap();
+    let org_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO org_user (org_id, display_name, role, created_at, updated_at) VALUES (?1, 'Owner', 'owner', ?2, ?3)",
+        rusqlite::params![org_id, now, now],
+    ).unwrap();
+    let owner_user_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO org_owner (org_id, owner_user_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![org_id, owner_user_id, now],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO org_settings (org_id, mode, updated_at) VALUES (?1, 'hierarchy', ?2)",
+        rusqlite::params![org_id, now],
+    ).unwrap();
+    org_id
+}
+
+fn db_delete_org(conn: &Connection, id: i64) {
+    conn.execute("DELETE FROM org WHERE id = ?1", rusqlite::params![id]).unwrap();
+}
+
+fn db_rename_org(conn: &Connection, id: i64, name: &str) {
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute("UPDATE org SET name = ?1, updated_at = ?2 WHERE id = ?3", rusqlite::params![name, now, id]).unwrap();
+}
+
+
+fn db_load_org_users(conn: &Connection, org_id: i64) -> Vec<OrgUser> {
+    let mut stmt = conn.prepare(
+        "SELECT id, org_id, display_name, role, created_at, updated_at FROM org_user WHERE org_id = ?1 ORDER BY id",
+    ).unwrap();
+    let rows = stmt.query_map(rusqlite::params![org_id], |row| {
+        Ok(OrgUser {
+            id: row.get(0)?,
+            org_id: row.get(1)?,
+            display_name: row.get(2)?,
+            role: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
+    }).unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+fn db_add_org_user(conn: &Connection, org_id: i64, display_name: &str, role: &str) -> i64 {
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO org_user (org_id, display_name, role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![org_id, display_name, role, now, now],
+    ).unwrap();
+    conn.last_insert_rowid()
+}
+
+fn db_update_org_user(conn: &Connection, user_id: i64, display_name: &str, role: &str) {
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute(
+        "UPDATE org_user SET display_name = ?1, role = ?2, updated_at = ?3 WHERE id = ?4",
+        rusqlite::params![display_name, role, now, user_id],
+    ).unwrap();
+}
+
+fn db_promote_lead_if_needed(conn: &Connection, user_id: i64) {
+    let role: Option<String> = conn.query_row(
+        "SELECT role FROM org_user WHERE id = ?1",
+        rusqlite::params![user_id],
+        |row| row.get(0),
+    ).ok();
+    if let Some(role) = role {
+        if role == "member" {
+            let now = chrono::Local::now().to_rfc3339();
+            conn.execute(
+                "UPDATE org_user SET role = 'lead', updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, user_id],
+            ).unwrap();
+        }
+    }
+}
+
+fn db_remove_org_user(conn: &Connection, user_id: i64, org_id: i64) {
+    let reports: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT report_id FROM org_chart WHERE manager_id = ?1").unwrap();
+        stmt.query_map(rusqlite::params![user_id], |row| row.get(0)).unwrap()
+            .filter_map(|r| r.ok()).collect()
+    };
+    let new_manager: Option<i64> = {
+        let mut stmt = conn.prepare("SELECT manager_id FROM org_chart WHERE report_id = ?1").unwrap();
+        stmt.query_row(rusqlite::params![user_id], |row| row.get(0)).ok()
+    };
+    if let Some(mgr) = new_manager {
+        for rid in &reports {
+            db_add_chart_link(conn, org_id, mgr, *rid);
+        }
+    }
+    conn.execute("DELETE FROM org_chart WHERE manager_id = ?1 OR report_id = ?1", rusqlite::params![user_id]).unwrap();
+    conn.execute("DELETE FROM task_assignment WHERE user_id = ?1", rusqlite::params![user_id]).unwrap();
+    conn.execute("DELETE FROM org_user WHERE id = ?1", rusqlite::params![user_id]).unwrap();
+}
+
+fn db_load_org_chart(conn: &Connection, org_id: i64) -> Vec<OrgChartLink> {
+    let mut stmt = conn.prepare(
+        "SELECT id, org_id, manager_id, report_id, created_at FROM org_chart WHERE org_id = ?1 ORDER BY id",
+    ).unwrap();
+    let rows = stmt.query_map(rusqlite::params![org_id], |row| {
+        Ok(OrgChartLink {
+            id: row.get(0)?,
+            org_id: row.get(1)?,
+            manager_id: row.get(2)?,
+            report_id: row.get(3)?,
+            created_at: row.get(4)?,
+        })
+    }).unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+fn db_add_chart_link(conn: &Connection, org_id: i64, manager_id: i64, report_id: i64) -> i64 {
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO org_chart (org_id, manager_id, report_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![org_id, manager_id, report_id, now],
+    ).unwrap();
+    db_promote_lead_if_needed(conn, manager_id);
+    conn.last_insert_rowid()
+}
+
+fn db_remove_chart_link(conn: &Connection, link_id: i64) {
+    conn.execute("DELETE FROM org_chart WHERE id = ?1", rusqlite::params![link_id]).unwrap();
+}
+
+fn db_load_task_assignments(conn: &Connection, feature_id: &str) -> Vec<TaskAssignment> {
+    let mut stmt = conn.prepare(
+        "SELECT id, user_id FROM task_assignment WHERE feature_id = ?1",
+    ).unwrap();
+    let rows = stmt.query_map(rusqlite::params![feature_id], |row| {
+        Ok(TaskAssignment {
+            id: row.get(0)?,
+            user_id: row.get(1)?,
+        })
+    }).unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+fn db_assign_task(conn: &Connection, feature_id: &str, user_id: i64) -> i64 {
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO task_assignment (feature_id, user_id, status, assigned_at, updated_at) VALUES (?1, ?2, 'Assigned', ?3, ?4)",
+        rusqlite::params![feature_id, user_id, now, now],
+    ).unwrap();
+    conn.last_insert_rowid()
+}
+
+fn db_unassign_task(conn: &Connection, assignment_id: i64) {
+    conn.execute("DELETE FROM task_assignment WHERE id = ?1", rusqlite::params![assignment_id]).unwrap();
+}
+
+fn db_org_owner_id(conn: &Connection, org_id: i64) -> Option<i64> {
+    conn.query_row(
+        "SELECT owner_user_id FROM org_owner WHERE org_id = ?1",
+        rusqlite::params![org_id],
+        |row| row.get(0),
+    ).ok()
+}
+
+fn db_update_org_owner(conn: &Connection, org_id: i64, new_owner_id: i64) {
+    let old_owner_id = db_org_owner_id(conn, org_id);
+    if old_owner_id == Some(new_owner_id) {
+        return;
+    }
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute(
+        "UPDATE org_owner SET owner_user_id = ?1 WHERE org_id = ?2",
+        rusqlite::params![new_owner_id, org_id],
+    ).unwrap();
+    conn.execute(
+        "UPDATE org_user SET role = 'owner', updated_at = ?1 WHERE id = ?2",
+        rusqlite::params![now, new_owner_id],
+    ).unwrap();
+    if let Some(old_id) = old_owner_id {
+        conn.execute(
+            "UPDATE org_user SET role = 'admin', updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, old_id],
+        ).unwrap();
+    }
+}
+
+fn db_load_org_settings(conn: &Connection, org_id: i64) -> OrgSettings {
+    conn.query_row(
+        "SELECT org_id, mode, updated_at FROM org_settings WHERE org_id = ?1",
+        rusqlite::params![org_id],
+        |row| {
+            Ok(OrgSettings {
+                org_id: row.get(0)?,
+                mode: row.get(1)?,
+                updated_at: row.get(2)?,
+            })
+        },
+    ).unwrap_or(OrgSettings {
+        org_id,
+        mode: "hierarchy".to_string(),
+        updated_at: String::new(),
+    })
+}
+
+fn db_update_org_settings(conn: &Connection, org_id: i64, mode: &str) {
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute(
+        "UPDATE org_settings SET mode = ?1, updated_at = ?2 WHERE org_id = ?3",
+        rusqlite::params![mode, now, org_id],
+    ).unwrap();
+}
+
+
 #[derive(Clone, Debug)]
 struct Quarter {
     year: u32,
@@ -266,6 +545,44 @@ impl Quarter {
         };
         format!("{} - {}", start.format("%b %d"), end.format("%b %d"))
     }
+}
+
+#[derive(Clone, Debug)]
+struct Org {
+    id: i64,
+    name: String,
+}
+
+#[derive(Clone, Debug)]
+struct OrgUser {
+    id: i64,
+    org_id: i64,
+    display_name: String,
+    role: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Clone, Debug)]
+struct OrgChartLink {
+    id: i64,
+    org_id: i64,
+    manager_id: i64,
+    report_id: i64,
+    created_at: String,
+}
+
+#[derive(Clone, Debug)]
+struct TaskAssignment {
+    id: i64,
+    user_id: i64,
+}
+
+#[derive(Clone, Debug)]
+struct OrgSettings {
+    org_id: i64,
+    mode: String,
+    updated_at: String,
 }
 
 struct FeatureDialogState {
@@ -452,6 +769,43 @@ enum DialogAction {
     OpenEditFeature(usize, usize),
 }
 
+#[derive(Default)]
+enum OrgDialogState {
+    #[default]
+    None,
+    CreateOrg {
+        name: String,
+    },
+    AddMember {
+        display_name: String,
+        role: String,
+        report_to: Option<i64>,
+    },
+    EditMember {
+        user_id: i64,
+        display_name: String,
+        role: String,
+    },
+    AddReport {
+        manager_id: i64,
+    },
+    Settings {
+        org_id: i64,
+        name: String,
+        owner_id: Option<i64>,
+        mode: String,
+        allow_edit: bool,
+    },
+}
+
+#[derive(Clone)]
+struct AppSnapshot {
+    quarters: Vec<Quarter>,
+    org_members: Vec<OrgUser>,
+    org_chart_links: Vec<OrgChartLink>,
+    org_settings: OrgSettings,
+}
+
 struct RoadmapApp {
     quarters: Vec<Quarter>,
     db: Connection,
@@ -463,8 +817,8 @@ struct RoadmapApp {
     offline: bool,
     use_keychain: bool,
     db_key: Option<String>,
-    undo_stack: Vec<Vec<Quarter>>,
-    redo_stack: Vec<Vec<Quarter>>,
+    undo_stack: Vec<AppSnapshot>,
+    redo_stack: Vec<AppSnapshot>,
     new_roadmap_name: String,
     current_tab: String,
     show_open_dialog: bool,
@@ -480,6 +834,24 @@ struct RoadmapApp {
     timeline_visible_status_buttons: bool,
     timeline_status_buttons_close_at: Option<std::time::Instant>,
     timeline_visible_status: Vec<(String, bool)>,
+    org_list: Vec<Org>,
+    current_org_id: Option<i64>,
+    org_members: Vec<OrgUser>,
+    org_chart_links: Vec<OrgChartLink>,
+    org_settings: OrgSettings,
+    org_dialog_state: OrgDialogState,
+    org_chart_scroll: f32,
+    org_chart_scroll_x: f32,
+    org_chart_zoom: f32,
+    org_selected_user_id: Option<i64>,
+    show_org_list_dialog: bool,
+    org_right_click_target: Option<i64>,
+    org_right_click_pos: Option<egui::Pos2>,
+    org_move_under_target: Option<i64>,
+    task_assign_feature_id: Option<String>,
+    task_assign_feature_title: String,
+    task_assign_user_id: Option<i64>,
+    task_assign_user_name: String,
 }
 
 impl RoadmapApp {
@@ -496,6 +868,7 @@ impl RoadmapApp {
             return Err("Could not open database: not unencrypted, no key file, no keychain entry".into());
         };
         let roadmap_list = db_list_roadmaps(&conn);
+        let org_list = db_list_orgs(&conn);
         let mut app = Self {
             quarters: Vec::new(),
             db: conn,
@@ -533,29 +906,123 @@ impl RoadmapApp {
                 ("Cancelled".into(), true),
                 ("Deferred".into(), true),
             ],
+            org_list,
+            current_org_id: None,
+            org_members: Vec::new(),
+            org_chart_links: Vec::new(),
+            org_settings: OrgSettings {
+                org_id: 0,
+                mode: "hierarchy".into(),
+                updated_at: String::new(),
+            },
+            org_dialog_state: OrgDialogState::None,
+            org_chart_scroll: 0.0,
+            org_chart_scroll_x: 0.0,
+            org_chart_zoom: 1.0,
+            org_selected_user_id: None,
+            show_org_list_dialog: false,
+            org_right_click_target: None,
+            org_right_click_pos: None,
+            org_move_under_target: None,
+            task_assign_feature_id: None,
+            task_assign_feature_title: String::new(),
+            task_assign_user_id: None,
+            task_assign_user_name: String::new(),
         };
         app.initialize_quarters();
         app.new_roadmap_name = "default".into();
+        if let Some(first_org) = app.org_list.first() {
+            app.current_org_id = Some(first_org.id);
+            app.org_members = db_load_org_users(&app.db, first_org.id);
+            app.org_chart_links = db_load_org_chart(&app.db, first_org.id);
+            app.org_settings = db_load_org_settings(&app.db, first_org.id);
+            app.org_selected_user_id = db_org_owner_id(&app.db, first_org.id);
+        }
         Ok(app)
     }
 
     fn save_snapshot(&mut self) {
-        self.undo_stack.push(self.quarters.clone());
+        self.undo_stack.push(AppSnapshot {
+            quarters: self.quarters.clone(),
+            org_members: self.org_members.clone(),
+            org_chart_links: self.org_chart_links.clone(),
+            org_settings: self.org_settings.clone(),
+        });
         self.undo_stack.truncate(20);
         self.redo_stack.clear();
     }
 
     fn undo(&mut self) {
         if let Some(snapshot) = self.undo_stack.pop() {
-            self.redo_stack.push(std::mem::replace(&mut self.quarters, snapshot));
+            self.redo_stack.push(AppSnapshot {
+                quarters: self.quarters.clone(),
+                org_members: self.org_members.clone(),
+                org_chart_links: self.org_chart_links.clone(),
+                org_settings: self.org_settings.clone(),
+            });
+            self.quarters = snapshot.quarters;
+            self.org_members = snapshot.org_members;
+            self.org_chart_links = snapshot.org_chart_links;
+            self.org_settings = snapshot.org_settings;
+            self.restore_snapshot_to_db();
             self.status_text = "Undo Action".into();
         }
     }
 
     fn redo(&mut self) {
         if let Some(snapshot) = self.redo_stack.pop() {
-            self.undo_stack.push(std::mem::replace(&mut self.quarters, snapshot));
+            self.undo_stack.push(AppSnapshot {
+                quarters: self.quarters.clone(),
+                org_members: self.org_members.clone(),
+                org_chart_links: snapshot.org_chart_links.clone(),
+                org_settings: self.org_settings.clone(),
+            });
+            self.quarters = snapshot.quarters;
+            self.org_members = snapshot.org_members;
+            self.org_chart_links = snapshot.org_chart_links;
+            self.org_settings = snapshot.org_settings;
+            self.restore_snapshot_to_db();
             self.status_text = "Redo Action".into();
+        }
+    }
+
+    fn restore_snapshot_to_db(&self) {
+        if let Some(org_id) = self.current_org_id {
+            self.db.execute("DELETE FROM org_chart WHERE org_id = ?1", rusqlite::params![org_id]).ok();
+            for link in &self.org_chart_links {
+                self.db.execute(
+                    "INSERT OR IGNORE INTO org_chart (id, org_id, manager_id, report_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![link.id, link.org_id, link.manager_id, link.report_id, link.created_at],
+                ).ok();
+            }
+            let existing_ids: std::collections::HashSet<i64> = {
+                let mut stmt = self.db.prepare("SELECT id FROM org_user WHERE org_id = ?1").unwrap();
+                stmt.query_map(rusqlite::params![org_id], |row| row.get(0)).unwrap()
+                    .filter_map(|r| r.ok()).collect()
+            };
+            let snapshot_ids: std::collections::HashSet<i64> = self.org_members.iter().map(|m| m.id).collect();
+            for &id in existing_ids.difference(&snapshot_ids) {
+                self.db.execute("DELETE FROM org_user WHERE id = ?1", rusqlite::params![id]).ok();
+            }
+            for m in &self.org_members {
+                if !existing_ids.contains(&m.id) {
+                    self.db.execute(
+                        "INSERT INTO org_user (id, org_id, display_name, role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![m.id, m.org_id, m.display_name, m.role, m.created_at, m.updated_at],
+                    ).ok();
+                } else {
+                    self.db.execute(
+                        "UPDATE org_user SET display_name = ?1, role = ?2, updated_at = ?3 WHERE id = ?4",
+                        rusqlite::params![m.display_name, m.role, m.updated_at, m.id],
+                    ).ok();
+                }
+            }
+            if self.org_settings.org_id == org_id {
+                self.db.execute(
+                    "UPDATE org_settings SET mode = ?1, updated_at = ?2 WHERE org_id = ?3",
+                    rusqlite::params![self.org_settings.mode, self.org_settings.updated_at, org_id],
+                ).ok();
+            }
         }
     }
 
@@ -572,9 +1039,8 @@ impl RoadmapApp {
             if self.current_tab == "Quarters" {
                 self.current_tab = "Timeline".into();
             } else if self.current_tab == "Timeline" {
-                self.current_tab = "Quarters".into();
+                self.current_tab = "Org Chart".into();
             } else if self.current_tab == "Org Chart" {
-                /* org chart currently disabled (wip) */
                 self.current_tab = "Quarters".into();
             }
         }
@@ -765,6 +1231,11 @@ impl RoadmapApp {
     }
 
     fn save_roadmap(&mut self) {
+        let has_features = self.quarters.iter().any(|q| !q.features.is_empty());
+        if !has_features {
+            self.status_text = "No features to save".into();
+            return;
+        }
         if let Some(id) = self.current_roadmap_id {
             db_save_roadmap(&self.db, id, &self.quarters);
             self.status_text = "Saved roadmap".into();
@@ -960,15 +1431,38 @@ impl eframe::App for RoadmapApp {
                         }
                     });
                     ui.menu_button("Organizations", |ui| {
-                        if ui.button("Join").clicked() {
-                            if self.offline == true {
-                                self.status_text = "Disable offline mode before joining an organization".into();
-                                ui.close_menu();
-                            }
+                        if ui.button("Switch").clicked() {
+                            self.show_org_list_dialog = true;
+                            ui.close_menu();
                         }
-                        if ui.button("Create").clicked() {}
+                        if ui.button("Create").clicked() {
+                            self.org_dialog_state = OrgDialogState::CreateOrg { name: String::new() };
+                            ui.close_menu();
+                        }
                         ui.separator();
-                        if ui.button("Settings").clicked() {}
+                        if ui.button("Join").clicked() {
+                            self.status_text = "Join requires sync (paid version)".into();
+                            ui.close_menu();
+                        }
+                        if ui.button("Settings").clicked() {
+                            if let Some(org_id) = self.current_org_id {
+                                let owner_id = db_org_owner_id(&self.db, org_id);
+                                let allow_edit = owner_id.is_some();
+                                self.org_selected_user_id = owner_id;
+                                let org_name = self.org_list.iter().find(|o| o.id == org_id).map(|o| o.name.clone()).unwrap_or_default();
+                                let settings = db_load_org_settings(&self.db, org_id);
+                                self.org_dialog_state = OrgDialogState::Settings {
+                                    org_id,
+                                    name: org_name,
+                                    owner_id,
+                                    mode: settings.mode,
+                                    allow_edit,
+                                };
+                            } else {
+                                self.status_text = "No organization selected".into();
+                            }
+                            ui.close_menu();
+                        }
                     });
                 });
                 ui.menu_button("View", |ui| {
@@ -1001,7 +1495,7 @@ impl eframe::App for RoadmapApp {
             ui.horizontal(|ui| {
                 ui.label(&self.status_text);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.colored_label(egui::Color32::GRAY, "v1.2.0");
+                    ui.colored_label(egui::Color32::GRAY, "v1.3.0");
                 });
             });
         });
@@ -1054,7 +1548,9 @@ impl eframe::App for RoadmapApp {
                                             .outer_margin(0.0)
                                             .show(ui, |ui| {
                                             let available = ui.available_width();
-                                            ui.allocate_ui(egui::vec2(available, 36.0), |ui| {
+                                            let feature_id = feature.id.clone();
+                                            let feature_title = feature.title.clone();
+                                            let response = ui.allocate_ui(egui::vec2(available, 36.0), |ui| {
                                                 ui.horizontal(|ui| {
                                                     let color = parse_color(&feature.color);
                                                     let (rect, _) = ui.allocate_exact_size(
@@ -1099,6 +1595,13 @@ impl eframe::App for RoadmapApp {
                                                         }
                                                     });
                                                 });
+                                            }).response;
+                                            response.context_menu(|ui| {
+                                                if ui.button("Assign Tasks").clicked() {
+                                                    self.task_assign_feature_id = Some(feature_id.clone());
+                                                    self.task_assign_feature_title = feature_title.clone();
+                                                    ui.close_menu();
+                                                }
                                             });
                                         });
                                     }
@@ -1108,6 +1611,7 @@ impl eframe::App for RoadmapApp {
                     }
 
                     if let Some(qi) = quarter_remove_idx {
+                        self.save_snapshot();
                         self.remove_quarter(qi);
                     }
 
@@ -1188,7 +1692,7 @@ impl eframe::App for RoadmapApp {
                 if all_quarters.is_empty() || all_quarters.iter().all(|(_, q)| q.is_empty()) {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
-                        ui.label("No quarters to show. Check a roadmap.");
+                        ui.label("No quarters to show. Save a roadmap to view here.");
                     });
                 } else {
                     let flat_qs: Vec<&Quarter> = all_quarters.iter().flat_map(|(_, qs)| qs.iter()).collect();
@@ -1552,6 +2056,527 @@ impl eframe::App for RoadmapApp {
                         }
                     }
                 }
+            } else if self.current_tab == "Org Chart" {
+                if self.org_list.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.label("No organization created yet.");
+                        ui.add_space(8.0);
+                        if ui.button("Create Organization").clicked() {
+                            self.org_dialog_state = OrgDialogState::CreateOrg { name: String::new() };
+                        }
+                    });
+                } else {
+                    let current_org_name = self.org_list.iter()
+                        .find(|o| Some(o.id) == self.current_org_id)
+                        .map(|o| o.name.clone())
+                        .unwrap_or_default();
+
+                    let owner_id = self.current_org_id.and_then(|oid| db_org_owner_id(&self.db, oid));
+
+                    ui.horizontal(|ui| {
+                        ui.heading(&current_org_name);
+                        ui.add_space(8.0);
+                        if ui.small_button("Switch Org").clicked() {
+                            self.show_org_list_dialog = true;
+                        }
+                        if ui.small_button("+ Member").clicked() {
+                            self.org_dialog_state = OrgDialogState::AddMember {
+                                display_name: String::new(),
+                                role: "member".to_string(),
+                                report_to: None,
+                            };
+                        }
+                        if ui.small_button("+ Link").clicked() {
+                            if self.org_selected_user_id.is_some() {
+                                self.org_dialog_state = OrgDialogState::AddReport {
+                                    manager_id: self.org_selected_user_id.unwrap(),
+                                };
+                            } else {
+                                self.status_text = "Select a manager first".into();
+                            }
+                        }
+                        if ui.small_button("Settings").clicked() {
+                            if let Some(org_id) = self.current_org_id {
+                                let allow_edit = owner_id.is_some();
+                                self.org_selected_user_id = owner_id;
+                                let org_name = self.org_list.iter().find(|o| o.id == org_id).map(|o| o.name.clone()).unwrap_or_default();
+                                let owner_id = db_org_owner_id(&self.db, org_id);
+                                let settings = db_load_org_settings(&self.db, org_id);
+                                self.org_dialog_state = OrgDialogState::Settings {
+                                    org_id,
+                                    name: org_name,
+                                    owner_id,
+                                    mode: settings.mode,
+                                    allow_edit,
+                                };
+                            }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("+ Org").clicked() {
+                                self.org_dialog_state = OrgDialogState::CreateOrg { name: String::new() };
+                            }
+                        });
+                    });
+                    ui.separator();
+
+                    if self.org_members.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.label("No members. Add someone to get started.");
+                        });
+                    } else {
+                        let user_map: std::collections::HashMap<i64, OrgUser> = self.org_members.iter().map(|m| (m.id, m.clone())).collect();
+
+                        let node_w: f32 = 160.0;
+                        let node_h: f32 = 48.0;
+                        let h_gap: f32 = 24.0;
+                        let v_gap: f32 = 64.0;
+                        let mut positions: Vec<(i64, f32, f32)> = Vec::new();
+                        let mut unlinked: Vec<i64> = Vec::new();
+                        let mut draw_links = true;
+
+                        let is_flat = self.org_settings.mode == "flat";
+                        if is_flat {
+                            draw_links = false;
+                            let count = self.org_members.len();
+                            if count > 0 {
+                                let radius = ((count as f32) * (node_w + h_gap)) / (2.0 * std::f32::consts::PI);
+                                let radius = radius.max(node_w * 1.5);
+                                for (idx, member) in self.org_members.iter().enumerate() {
+                                    let angle = (idx as f32) * std::f32::consts::TAU / (count as f32);
+                                    let x = radius * angle.cos();
+                                    let y = radius * angle.sin();
+                                    positions.push((member.id, x, y));
+                                }
+                            }
+                        } else {
+                            let reports_of: std::collections::HashMap<i64, Vec<i64>> = {
+                                let mut map: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+                                for link in &self.org_chart_links {
+                                    let entry = map.entry(link.manager_id).or_default();
+                                    if !entry.contains(&link.report_id) {
+                                        entry.push(link.report_id);
+                                    }
+                                }
+                                map
+                            };
+                            let is_report: std::collections::HashSet<i64> = self.org_chart_links.iter().map(|l| l.report_id).collect();
+
+                            let linked_ids: std::collections::HashSet<i64> = {
+                                let mut set = std::collections::HashSet::new();
+                                for link in &self.org_chart_links {
+                                    set.insert(link.manager_id);
+                                    set.insert(link.report_id);
+                                }
+                                if let Some(oid) = owner_id {
+                                    set.insert(oid);
+                                }
+                                set
+                            };
+
+                            unlinked = self.org_members.iter()
+                                .filter(|m| !linked_ids.contains(&m.id))
+                                .map(|m| m.id)
+                                .collect();
+
+                            let roots: Vec<i64> = if let Some(oid) = owner_id {
+                                vec![oid]
+                            } else {
+                                self.org_members.iter()
+                                    .filter(|m| !is_report.contains(&m.id))
+                                    .map(|m| m.id)
+                                    .collect()
+                            };
+
+                            fn subtree_width(id: i64, reports_of: &std::collections::HashMap<i64, Vec<i64>>, nw: f32, hg: f32) -> f32 {
+                                let children = reports_of.get(&id).cloned().unwrap_or_default();
+                                if children.is_empty() { return nw; }
+                                let cw: f32 = children.iter().map(|c| subtree_width(*c, reports_of, nw, hg)).sum::<f32>() + hg * (children.len().max(1) - 1) as f32;
+                                cw.max(nw)
+                            }
+
+                            fn layout_tree(
+                                id: i64,
+                                x: f32,
+                                y: f32,
+                                reports_of: &std::collections::HashMap<i64, Vec<i64>>,
+                                positions: &mut Vec<(i64, f32, f32)>,
+                                nw: f32, nh: f32, vg: f32, hg: f32,
+                            ) {
+                                let children = reports_of.get(&id).cloned().unwrap_or_default();
+                                if children.is_empty() {
+                                    let w = subtree_width(id, reports_of, nw, hg);
+                                    positions.push((id, x + w / 2.0, y));
+                                } else {
+                                    let mut cx = x;
+                                    for child in &children {
+                                        let cw = subtree_width(*child, reports_of, nw, hg);
+                                        layout_tree(*child, cx, y + nh + vg, reports_of, positions, nw, nh, vg, hg);
+                                        cx += cw + hg;
+                                    }
+                                    let cset: std::collections::HashSet<i64> = children.into_iter().collect();
+                                    let leftmost = positions.iter().filter(|(c, _, _)| cset.contains(c)).map(|(_, px, _)| *px).fold(f32::INFINITY, f32::min);
+                                    let rightmost = positions.iter().filter(|(c, _, _)| cset.contains(c)).map(|(_, px, _)| *px).fold(f32::NEG_INFINITY, f32::max);
+                                    positions.push((id, (leftmost + rightmost) / 2.0, y));
+                                }
+                            }
+
+                            let mut ox = 0.0_f32;
+                            for root_id in &roots {
+                                let w = subtree_width(*root_id, &reports_of, node_w, h_gap);
+                                layout_tree(*root_id, ox, 0.0, &reports_of, &mut positions, node_w, node_h, v_gap, h_gap);
+                                ox += w + h_gap;
+                            }
+                            for (i, uid) in unlinked.iter().enumerate() {
+                                positions.push((*uid, ox + (i as f32) * (node_w + h_gap) + node_w / 2.0, 0.0));
+                            }
+                        }
+
+                        if positions.is_empty() {
+                            return;
+                        }
+
+                        let tree_min_x = positions.iter().map(|(_, x, _)| *x).fold(f32::INFINITY, f32::min);
+                        let tree_max_x = positions.iter().map(|(_, x, _)| *x).fold(f32::NEG_INFINITY, f32::max);
+                        let tree_max_y = positions.iter().map(|(_, _, y)| *y).fold(f32::NEG_INFINITY, f32::max);
+
+                        let owner_cx = if let Some(oid) = owner_id {
+                            positions.iter().find(|(id, _, _)| *id == oid).map(|(_, x, _)| *x).unwrap_or((tree_min_x + tree_max_x) / 2.0)
+                        } else {
+                            (tree_min_x + tree_max_x) / 2.0
+                        };
+
+                        if !ui.input(|i| i.pointer.primary_down()) {
+                            let sd = ui.input(|i| i.raw_scroll_delta);
+                            self.org_chart_scroll -= sd.y * 0.8;
+                            self.org_chart_scroll_x += sd.x * 0.8;
+                            let zoom_delta = ui.input(|i| i.zoom_delta());
+                            if zoom_delta != 1.0 {
+                                self.org_chart_zoom = (self.org_chart_zoom * zoom_delta).clamp(0.3, 5.0);
+                            }
+                        }
+                        ui.ctx().input(|i| {
+                            for ev in &i.raw.events {
+                                if let egui::Event::MouseWheel { delta, .. } = ev {
+                                    self.org_chart_scroll -= delta.y * 0.8;
+                                    self.org_chart_scroll_x += delta.x * 0.8;
+                                }
+                            }
+                        });
+
+                        let zoom = self.org_chart_zoom;
+                        let (response, painter) = ui.allocate_painter(
+                            ui.available_size(),
+                            egui::Sense::click(),
+                        );
+                        let rect = response.rect;
+                        let view_cx = rect.center().x;
+                        let view_top = rect.top() + 30.0;
+
+                        let total_h = (tree_max_y + node_h + 60.0) * zoom;
+                        let scroll_limit_y = ((total_h - rect.height()) / 2.0).max(0.0) + 50.0;
+                        self.org_chart_scroll = self.org_chart_scroll.clamp(-scroll_limit_y, scroll_limit_y);
+
+                        let total_w = (tree_max_x - tree_min_x + node_w + 40.0) * zoom;
+                        let scroll_limit_x = (((total_w - rect.width()) / 2.0).max(0.0) + 50.0) * 3.0;
+                        self.org_chart_scroll_x = self.org_chart_scroll_x.clamp(-scroll_limit_x, scroll_limit_x);
+
+                        let (ox, oy) = if is_flat {
+                            (
+                                rect.center().x + self.org_chart_scroll_x,
+                                rect.center().y - (node_h * zoom * 0.5) - self.org_chart_scroll,
+                            )
+                        } else {
+                            (
+                                view_cx - owner_cx * zoom + self.org_chart_scroll_x,
+                                view_top - self.org_chart_scroll,
+                            )
+                        };
+
+                        if draw_links {
+                            for link in &self.org_chart_links {
+                                if let (Some((_, mx, my)), Some((_, rx, ry))) = (
+                                    positions.iter().find(|(id, _, _)| *id == link.manager_id),
+                                    positions.iter().find(|(id, _, _)| *id == link.report_id),
+                                ) {
+                                    let x1 = ox + mx * zoom;
+                                    let y1 = oy + my * zoom + node_h * zoom;
+                                    let x2 = ox + rx * zoom;
+                                    let y2 = oy + ry * zoom;
+                                    let mid = y1 + (y2 - y1) / 2.0;
+                                    painter.line_segment([egui::pos2(x1, y1), egui::pos2(x1, mid)], egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 120, 120)));
+                                    painter.line_segment([egui::pos2(x1, mid), egui::pos2(x2, mid)], egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 120, 120)));
+                                    painter.line_segment([egui::pos2(x2, mid), egui::pos2(x2, y2)], egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 120, 120)));
+                                }
+                            }
+                        } else {
+                            let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(90, 90, 90));
+                            for i in 0..positions.len() {
+                                for j in (i + 1)..positions.len() {
+                                    let (_, x1, y1) = positions[i];
+                                    let (_, x2, y2) = positions[j];
+                                    let p1 = egui::pos2(ox + x1 * zoom, oy + y1 * zoom + node_h * zoom * 0.5);
+                                    let p2 = egui::pos2(ox + x2 * zoom, oy + y2 * zoom + node_h * zoom * 0.5);
+                                    painter.line_segment([p1, p2], stroke);
+                                }
+                            }
+                        }
+
+                        for (uid, px, py) in &positions {
+                            if let Some(user) = user_map.get(uid) {
+                                let nw = node_w * zoom;
+                                let nh = node_h * zoom;
+                                let cx = ox + px * zoom - nw / 2.0;
+                                let cy = oy + py * zoom;
+                                let nr = egui::Rect::from_min_max(egui::pos2(cx, cy), egui::pos2(cx + nw, cy + nh));
+
+                                let is_selected = self.org_selected_user_id == Some(*uid);
+                                let is_owner = user.role == "owner";
+                                let is_unlinked = unlinked.contains(uid);
+                                let bg = if is_selected {
+                                    egui::Color32::from_rgb(50, 70, 100)
+                                } else if is_owner {
+                                    egui::Color32::from_rgb(60, 50, 30)
+                                } else if is_unlinked {
+                                    egui::Color32::from_rgb(35, 35, 40)
+                                } else {
+                                    egui::Color32::from_rgb(45, 45, 50)
+                                };
+                                let border = if is_owner {
+                                    egui::Color32::from_rgb(255, 193, 7)
+                                } else if is_selected {
+                                    egui::Color32::from_rgb(100, 150, 255)
+                                } else if is_unlinked {
+                                    egui::Color32::from_rgb(60, 60, 60)
+                                } else {
+                                    egui::Color32::from_rgb(80, 80, 80)
+                                };
+
+                                painter.rect_filled(nr, 4.0 * zoom, bg);
+                                painter.rect_stroke(nr, 4.0 * zoom, egui::Stroke::new(1.0_f32, border));
+
+                                painter.text(
+                                    egui::pos2(cx + nw / 2.0, cy + nh * 0.3),
+                                    egui::Align2::CENTER_CENTER,
+                                    &user.display_name,
+                                    egui::FontId::proportional(13.0 * zoom),
+                                    egui::Color32::WHITE,
+                                );
+
+                                let role_color = if is_owner {
+                                    egui::Color32::from_rgb(255, 193, 7)
+                                } else if user.role == "member" {
+                                    egui::Color32::from_rgb(180, 180, 180)
+                                } else {
+                                    egui::Color32::from_rgb(76, 175, 80)
+                                };
+                                painter.text(
+                                    egui::pos2(cx + nw / 2.0, cy + nh * 0.7),
+                                    egui::Align2::CENTER_CENTER,
+                                    &user.role,
+                                    egui::FontId::proportional(10.0 * zoom),
+                                    role_color,
+                                );
+
+                                if response.clicked() {
+                                    if let Some(pos) = response.hover_pos() {
+                                        if nr.contains(pos) {
+                                            self.org_selected_user_id = Some(*uid);
+                                        }
+                                    }
+                                }
+                                if response.secondary_clicked() {
+                                    if let Some(pos) = response.hover_pos() {
+                                        if nr.contains(pos) {
+                                            self.org_right_click_target = Some(*uid);
+                                            self.org_right_click_pos = Some(pos);
+                                            self.org_selected_user_id = Some(*uid);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(rc_uid) = self.org_right_click_target {
+                            let mut close_menu = false;
+                            let menu_pos = self.org_right_click_pos.unwrap_or(egui::pos2(0.0, 0.0));
+
+                            egui::Area::new(egui::Id::new("org_ctx_menu"))
+                                .fixed_pos(menu_pos)
+                                .order(egui::Order::Foreground)
+                                .show(ui.ctx(), |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.set_min_width(200.0);
+                                        let rc_user = self.org_members.iter().find(|m| m.id == rc_uid).cloned();
+                                        let rc_name = rc_user.as_ref().map(|u| u.display_name.clone()).unwrap_or_default();
+                                        let rc_role = rc_user.as_ref().map(|u| u.role.clone()).unwrap_or_default();
+                                        let is_owner = rc_role == "owner";
+
+                                        ui.label(egui::RichText::new(&rc_name).strong());
+                                        ui.colored_label(egui::Color32::GRAY, format!("Role: {}", rc_role));
+                                        ui.separator();
+
+                                        if ui.button("Edit Name / Role").clicked() {
+                                            self.org_dialog_state = OrgDialogState::EditMember {
+                                                user_id: rc_uid,
+                                                display_name: rc_name.clone(),
+                                                role: rc_role,
+                                            };
+                                            close_menu = true;
+                                        }
+
+                                        if ui.button("Add Report Under").clicked() {
+                                            self.org_dialog_state = OrgDialogState::AddReport {
+                                                manager_id: rc_uid,
+                                            };
+                                            close_menu = true;
+                                        }
+
+                                        if ui.button("Assign Tasks").clicked() {
+                                            self.task_assign_user_id = Some(rc_uid);
+                                            self.task_assign_user_name = rc_name.clone();
+                                            close_menu = true;
+                                        }
+
+                                        if ui.button("Move Under...").clicked() {
+                                            self.org_move_under_target = Some(rc_uid);
+                                            close_menu = true;
+                                        }
+
+                                        let managed: Vec<i64> = self.org_chart_links.iter()
+                                            .filter(|l| l.manager_id == rc_uid)
+                                            .map(|l| l.report_id)
+                                            .collect();
+                                        if !managed.is_empty() {
+                                            ui.separator();
+                                            ui.colored_label(egui::Color32::GRAY, "Direct Reports:");
+                                            for rid in &managed {
+                                                if let Some(name) = user_map.get(rid).map(|u| u.display_name.clone()) {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(&name);
+                                                        if ui.small_button("Unlink").clicked() {
+                                                            let link_id = self.org_chart_links.iter().find(|l| l.manager_id == rc_uid && l.report_id == *rid).map(|l| l.id);
+                                                            if let Some(link_id) = link_id {
+                                                                self.save_snapshot();
+                                                                db_remove_chart_link(&self.db, link_id);
+                                                                self.org_chart_links = self.current_org_id.map_or(Vec::new(), |oid| db_load_org_chart(&self.db, oid));
+                                                            }
+                                                            close_menu = true;
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        }
+
+                                        let reports_to: Option<i64> = self.org_chart_links.iter()
+                                            .find(|l| l.report_id == rc_uid)
+                                            .map(|l| l.manager_id);
+                                        if let Some(mgr_id) = reports_to {
+                                            if let Some(mgr_name) = user_map.get(&mgr_id).map(|u| u.display_name.clone()) {
+                                                ui.separator();
+                                                ui.horizontal(|ui| {
+                                                    ui.label(format!("Reports to: {}", mgr_name));
+                                                    if ui.small_button("Unlink").clicked() {
+                                                        let link_id = self.org_chart_links.iter().find(|l| l.report_id == rc_uid).map(|l| l.id);
+                                                        if let Some(link_id) = link_id {
+                                                            self.save_snapshot();
+                                                            db_remove_chart_link(&self.db, link_id);
+                                                            self.org_chart_links = self.current_org_id.map_or(Vec::new(), |oid| db_load_org_chart(&self.db, oid));
+                                                        }
+                                                        close_menu = true;
+                                                    }
+                                                });
+                                            }
+                                        }
+
+                                        if !is_owner {
+                                            ui.separator();
+                                            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), "Danger");
+                                            if ui.button("Remove Member").clicked() {
+                                                self.save_snapshot();
+                                                db_remove_org_user(&self.db, rc_uid, self.current_org_id.unwrap_or(0));
+                                                self.org_members = self.current_org_id.map_or(Vec::new(), |oid| db_load_org_users(&self.db, oid));
+                                                self.org_chart_links = self.current_org_id.map_or(Vec::new(), |oid| db_load_org_chart(&self.db, oid));
+                                                self.org_selected_user_id = None;
+                                                self.status_text = "Removed member".into();
+                                                close_menu = true;
+                                            }
+                                        }
+
+                                        ui.separator();
+                                        if ui.button("Close").clicked() {
+                                            close_menu = true;
+                                        }
+                                    });
+                                });
+
+                            let menu_area = ui.ctx().memory(|m| m.area_rect(egui::Id::new("org_ctx_menu")));
+                            if let Some(mr) = menu_area {
+                                let mouse = ui.ctx().input(|i| i.pointer.latest_pos().unwrap_or(egui::pos2(-9999.0, -9999.0)));
+                                let anchor = self.org_right_click_pos.unwrap_or(egui::pos2(-9999.0, -9999.0));
+                                if !mr.contains(mouse) && ((mouse.x - anchor.x).abs() > 80.0 || (mouse.y - anchor.y).abs() > 80.0) {
+                                    close_menu = true;
+                                }
+                            }
+
+                            if close_menu || ui.ctx().input(|i| i.pointer.primary_clicked()) {
+                                self.org_right_click_target = None;
+                            }
+                        }
+
+                        if let Some(move_uid) = self.org_move_under_target {
+                            let mut close_move = false;
+                            let move_name = self.org_members.iter().find(|m| m.id == move_uid).map(|m| m.display_name.clone()).unwrap_or_default();
+                            let candidates: Vec<(i64, String)> = self.org_members.iter()
+                                .filter(|m| m.id != move_uid)
+                                .map(|m| (m.id, m.display_name.clone()))
+                                .collect();
+                            egui::Window::new(format!("Move {} under...", move_name)).collapsible(false).resizable(false).show(ctx, |ui| {
+                                if candidates.is_empty() {
+                                    ui.colored_label(egui::Color32::GRAY, "No other members.");
+                                }
+                                for c in &candidates {
+                                    if ui.button(&c.1).clicked() {
+                                        if let Some(org_id) = self.current_org_id {
+                                            let old_link_id = self.org_chart_links.iter().find(|l| l.report_id == move_uid).map(|l| l.id);
+                                            self.save_snapshot();
+                                            if let Some(old_link_id) = old_link_id {
+                                                db_remove_chart_link(&self.db, old_link_id);
+                                            }
+                                            if !self.org_chart_links.iter().any(|l| l.manager_id == c.0 && l.report_id == move_uid) {
+                                                db_add_chart_link(&self.db, org_id, c.0, move_uid);
+                                            }
+                                            self.org_chart_links = db_load_org_chart(&self.db, org_id);
+                                            self.org_members = db_load_org_users(&self.db, org_id);
+                                            self.status_text = format!("Moved {} under {}", move_name, c.1);
+                                        }
+                                        close_move = true;
+                                    }
+                                }
+                                ui.separator();
+                                if ui.button("Cancel").clicked() {
+                                    close_move = true;
+                                }
+                            });
+                            if close_move {
+                                self.org_move_under_target = None;
+                            }
+                        }
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if let Some(uid) = self.org_selected_user_id {
+                                if let Some(user) = self.org_members.iter().find(|m| m.id == uid) {
+                                    ui.label(egui::RichText::new(&user.display_name).strong());
+                                    ui.colored_label(egui::Color32::GRAY, format!("[{}]", user.role));
+                                }
+                            } else {
+                                ui.colored_label(egui::Color32::GRAY, "Click a node to select · Right-click for actions");
+                            }
+                        });
+                    }
+                }
             }
         });
 
@@ -1563,7 +2588,12 @@ impl eframe::App for RoadmapApp {
                 egui::Window::new("Add Feature").default_width(350.0).collapsible(false).resizable(false).show(ctx, |ui| {
                     if dialog.show(ui) {
                         if let Some(feat) = dialog.to_feature(&format!("f_{}", rand::random::<u64>())) {
-                            self.undo_stack.push(self.quarters.clone());
+                            self.undo_stack.push(AppSnapshot {
+                                quarters: self.quarters.clone(),
+                                org_members: self.org_members.clone(),
+                                org_chart_links: self.org_chart_links.clone(),
+                                org_settings: self.org_settings.clone(),
+                            });
                             self.undo_stack.truncate(20);
                             self.redo_stack.clear();
                             self.quarters[qi].features.push(feat);
@@ -1583,7 +2613,12 @@ impl eframe::App for RoadmapApp {
                 egui::Window::new("Edit Feature").default_width(350.0).collapsible(false).resizable(false).show(ctx, |ui| {
                     if dialog.show(ui) {
                         if let Some(feat) = dialog.to_feature(&existing_id) {
-                            self.undo_stack.push(self.quarters.clone());
+                            self.undo_stack.push(AppSnapshot {
+                                quarters: self.quarters.clone(),
+                                org_members: self.org_members.clone(),
+                                org_chart_links: self.org_chart_links.clone(),
+                                org_settings: self.org_settings.clone(),
+                            });
                             self.undo_stack.truncate(20);
                             self.redo_stack.clear();
                             self.quarters[qi].features[fi] = feat;
@@ -1601,6 +2636,465 @@ impl eframe::App for RoadmapApp {
 
         if close_dialog {
             self.dialog_state = DialogState::None;
+        }
+
+        enum OrgAction {
+            CreateOrg { name: String },
+            AddMember { display_name: String, role: String, report_to: Option<i64> },
+            EditMember { user_id: i64, display_name: String, role: String },
+            AddReport { manager_id: i64, report_id: i64, report_name: String },
+            UpdateSettings { org_id: i64, name: String, owner_id: Option<i64>, mode: String },
+        }
+
+        let mut close_org_dialog = false;
+        let mut org_action: Option<OrgAction> = None;
+        match &mut self.org_dialog_state {
+            OrgDialogState::CreateOrg { name } => {
+                egui::Window::new("Create Organization").collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.label("Organization name:");
+                    ui.text_edit_singleline(name);
+                    ui.horizontal(|ui| {
+                        if ui.button("Create").clicked() {
+                            if !name.trim().is_empty() {
+                                org_action = Some(OrgAction::CreateOrg { name: name.trim().to_string() });
+                            }
+                            close_org_dialog = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close_org_dialog = true;
+                        }
+                    });
+                });
+            }
+            OrgDialogState::AddMember { display_name, role, report_to } => {
+                let members_snapshot = self.org_members.clone();
+                egui::Window::new("Add Member").collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.label("Display name:");
+                    ui.text_edit_singleline(display_name);
+                    ui.label("Role:");
+                    let roles = ["member", "lead", "admin"];
+                    for r in &roles {
+                        if ui.radio(*role == *r, *r).clicked() {
+                            *role = r.to_string();
+                        }
+                    }
+                    ui.label("Reports to:");
+                    let current_name = report_to.and_then(|id| members_snapshot.iter().find(|m| m.id == id).map(|m| m.display_name.clone())).unwrap_or_else(|| "Owner (default)".to_string());
+                    egui::ComboBox::from_id_salt("report_to_select")
+                        .selected_text(&current_name)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(report_to.is_none(), "Owner (default)").clicked() {
+                                *report_to = None;
+                            }
+                            if ui.selectable_label(false, "None (unlinked)").clicked() {
+                                *report_to = None;
+                            }
+                            for m in &members_snapshot {
+                                if ui.selectable_label(*report_to == Some(m.id), &m.display_name).clicked() {
+                                    *report_to = Some(m.id);
+                                }
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        if ui.button("Add").clicked() {
+                            if !display_name.trim().is_empty() {
+                                org_action = Some(OrgAction::AddMember {
+                                    display_name: display_name.trim().to_string(),
+                                    role: role.clone(),
+                                    report_to: *report_to,
+                                });
+                            }
+                            close_org_dialog = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close_org_dialog = true;
+                        }
+                    });
+                });
+            }
+            OrgDialogState::EditMember { user_id, display_name, role } => {
+                let uid = *user_id;
+                egui::Window::new("Edit Member").collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.label("Display name:");
+                    ui.text_edit_singleline(display_name);
+                    ui.label("Role:");
+                    let roles = ["member", "lead", "admin", "owner"];
+                    for r in &roles {
+                        if ui.radio(*role == *r, *r).clicked() {
+                            *role = r.to_string();
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            if !display_name.trim().is_empty() {
+                                org_action = Some(OrgAction::EditMember {
+                                    user_id: uid,
+                                    display_name: display_name.trim().to_string(),
+                                    role: role.clone(),
+                                });
+                            }
+                            close_org_dialog = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close_org_dialog = true;
+                        }
+                    });
+                });
+            }
+            OrgDialogState::AddReport { manager_id } => {
+                let mgr = *manager_id;
+                let candidates: Vec<(i64, String)> = self.org_members.iter()
+                    .filter(|m| m.id != mgr)
+                    .filter(|m| !self.org_chart_links.iter().any(|l| l.manager_id == mgr && l.report_id == m.id))
+                    .map(|m| (m.id, m.display_name.clone()))
+                    .collect();
+                let mgr_name = self.org_members.iter().find(|m| m.id == mgr).map(|m| m.display_name.clone()).unwrap_or_default();
+                egui::Window::new(format!("Add Report under {}", mgr_name)).collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.label("Select a member to report to this manager:");
+                    for user in &candidates {
+                        let name = user.1.clone();
+                        if ui.button(&name).clicked() {
+                            org_action = Some(OrgAction::AddReport { manager_id: mgr, report_id: user.0, report_name: name });
+                            close_org_dialog = true;
+                        }
+                    }
+                    if candidates.is_empty() {
+                        ui.colored_label(egui::Color32::GRAY, "No available members to add.");
+                    }
+                    ui.separator();
+                    if ui.button("Cancel").clicked() {
+                        close_org_dialog = true;
+                    }
+                });
+            }
+            OrgDialogState::Settings { org_id, name, owner_id, mode, allow_edit } => {
+                let can_edit = *allow_edit;
+                let members_snapshot = self.org_members.clone();
+                let org_settings_snapshot: Vec<(i64, String, Option<i64>, String)> = self.org_list.iter()
+                    .map(|org| {
+                        let settings = db_load_org_settings(&self.db, org.id);
+                        (org.id, org.name.clone(), db_org_owner_id(&self.db, org.id), settings.mode)
+                    })
+                    .collect();
+                egui::Window::new("Organization Settings").collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.label("Organization:");
+                    egui::ComboBox::from_id_salt("org_settings_select")
+                        .selected_text(name.as_str())
+                        .show_ui(ui, |ui| {
+                            for (oid, oname, oowner, omode) in &org_settings_snapshot {
+                                if ui.selectable_label(*oid == *org_id, oname).clicked() {
+                                    *org_id = *oid;
+                                    *name = oname.clone();
+                                    *owner_id = *oowner;
+                                    *mode = omode.clone();
+                                    *allow_edit = owner_id.is_some();
+                                }
+                            }
+                        });
+                    ui.separator();
+                    ui.label("Organization name:");
+                    ui.add_enabled_ui(can_edit, |ui| {
+                        ui.text_edit_singleline(name);
+                    });
+                    ui.label("Owner:");
+                    ui.add_enabled_ui(can_edit, |ui| {
+                        let current_owner = owner_id.and_then(|id| members_snapshot.iter().find(|m| m.id == id).map(|m| m.display_name.clone())).unwrap_or_else(|| "Owner".to_string());
+                        egui::ComboBox::from_id_salt("org_settings_owner")
+                            .selected_text(current_owner)
+                            .show_ui(ui, |ui| {
+                                for member in &members_snapshot {
+                                    if ui.selectable_label(Some(member.id) == *owner_id, &member.display_name).clicked() {
+                                        *owner_id = Some(member.id);
+                                    }
+                                }
+                            });
+                    });
+                    ui.label("Org chart mode:");
+                    ui.add_enabled_ui(can_edit, |ui| {
+                        if ui.radio(mode.as_str() == "hierarchy", "Hierarchical").clicked() {
+                            *mode = "hierarchy".to_string();
+                        }
+                        if ui.radio(mode.as_str() == "flat", "Non hierarchical").clicked() {
+                            *mode = "flat".to_string();
+                        }
+                    });
+                    if !can_edit {
+                        ui.colored_label(egui::Color32::GRAY, "Only the owner can change settings.");
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            if can_edit {
+                                org_action = Some(OrgAction::UpdateSettings {
+                                    org_id: *org_id,
+                                    name: name.trim().to_string(),
+                                    owner_id: *owner_id,
+                                    mode: mode.clone(),
+                                });
+                            }
+                            close_org_dialog = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close_org_dialog = true;
+                        }
+                    });
+                });
+            }
+            OrgDialogState::None => {}
+        }
+        if let Some(action) = org_action {
+            match action {
+                OrgAction::CreateOrg { name } => {
+                    self.save_snapshot();
+                    let id = db_create_org(&self.db, name.trim());
+                    self.org_list = db_list_orgs(&self.db);
+                    self.current_org_id = Some(id);
+                    self.org_members = db_load_org_users(&self.db, id);
+                    self.org_chart_links = db_load_org_chart(&self.db, id);
+                    self.org_settings = db_load_org_settings(&self.db, id);
+                    self.status_text = format!("Created org: {}", name.trim());
+                }
+                OrgAction::AddMember { display_name, role, report_to } => {
+                    if let Some(org_id) = self.current_org_id {
+                        self.save_snapshot();
+                        let new_user_id = db_add_org_user(&self.db, org_id, display_name.trim(), &role);
+                        let manager = report_to.or_else(|| db_org_owner_id(&self.db, org_id));
+                        if let Some(mgr_id) = manager {
+                            if mgr_id != new_user_id {
+                                db_add_chart_link(&self.db, org_id, mgr_id, new_user_id);
+                            }
+                        }
+                        self.org_members = db_load_org_users(&self.db, org_id);
+                        self.org_chart_links = db_load_org_chart(&self.db, org_id);
+                        self.status_text = format!("Added member: {}", display_name.trim());
+                    }
+                }
+                OrgAction::EditMember { user_id, display_name, role } => {
+                    self.save_snapshot();
+                    db_update_org_user(&self.db, user_id, display_name.trim(), &role);
+                    if let Some(org_id) = self.current_org_id {
+                        self.org_members = db_load_org_users(&self.db, org_id);
+                    }
+                    self.status_text = format!("Updated member: {}", display_name.trim());
+                }
+                OrgAction::AddReport { manager_id, report_id, report_name } => {
+                    if let Some(org_id) = self.current_org_id {
+                        self.save_snapshot();
+                        db_add_chart_link(&self.db, org_id, manager_id, report_id);
+                        self.org_chart_links = db_load_org_chart(&self.db, org_id);
+                        self.org_members = db_load_org_users(&self.db, org_id);
+                        let mgr_name = self.org_members.iter().find(|m| m.id == manager_id).map(|m| m.display_name.clone()).unwrap_or_default();
+                        self.status_text = format!("Linked {} → {}", mgr_name, report_name);
+                    }
+                }
+                OrgAction::UpdateSettings { org_id, name, owner_id, mode } => {
+                    self.save_snapshot();
+                    if !name.trim().is_empty() {
+                        db_rename_org(&self.db, org_id, name.trim());
+                    }
+                    if let Some(owner_id) = owner_id {
+                        db_update_org_owner(&self.db, org_id, owner_id);
+                    }
+                    db_update_org_settings(&self.db, org_id, &mode);
+                    self.org_list = db_list_orgs(&self.db);
+                    self.current_org_id = Some(org_id);
+                    self.org_members = db_load_org_users(&self.db, org_id);
+                    self.org_chart_links = db_load_org_chart(&self.db, org_id);
+                    self.org_settings = db_load_org_settings(&self.db, org_id);
+                    self.org_selected_user_id = db_org_owner_id(&self.db, org_id);
+                    self.status_text = format!("Updated org settings: {}", self.org_settings.mode);
+                }
+            }
+        }
+
+        if close_org_dialog {
+            self.org_dialog_state = OrgDialogState::None;
+        }
+
+        enum TaskAssignAction {
+            Assign { feature_id: String, user_id: i64, user_name: String },
+            Unassign { assignment_id: i64, user_name: String },
+        }
+
+        let mut task_assign_action: Option<TaskAssignAction> = None;
+        if let Some(feature_id) = self.task_assign_feature_id.clone() {
+            let mut close_task_dialog = false;
+            let feature_title = self.task_assign_feature_title.clone();
+            let members_snapshot = self.org_members.clone();
+            let assignments = db_load_task_assignments(&self.db, &feature_id);
+            let mut assignment_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+            for assignment in &assignments {
+                assignment_map.insert(assignment.user_id, assignment.id);
+            }
+            let owner_id = self.current_org_id.and_then(|oid| db_org_owner_id(&self.db, oid));
+            let allow_assign = self.org_settings.mode == "flat" || self.org_selected_user_id == owner_id;
+            egui::Window::new(format!("Assign Tasks: {}", feature_title)).collapsible(false).resizable(false).show(ctx, |ui| {
+                if members_snapshot.is_empty() {
+                    ui.colored_label(egui::Color32::GRAY, "No org members available.");
+                } else {
+                    for member in &members_snapshot {
+                        ui.horizontal(|ui| {
+                            ui.label(&member.display_name);
+                            if let Some(assignment_id) = assignment_map.get(&member.id) {
+                                ui.colored_label(egui::Color32::GRAY, "Assigned");
+                                ui.add_enabled_ui(allow_assign, |ui| {
+                                    if ui.small_button("Unassign").clicked() {
+                                        task_assign_action = Some(TaskAssignAction::Unassign {
+                                            assignment_id: *assignment_id,
+                                            user_name: member.display_name.clone(),
+                                        });
+                                    }
+                                });
+                            } else {
+                                ui.add_enabled_ui(allow_assign, |ui| {
+                                    if ui.small_button("Assign").clicked() {
+                                        task_assign_action = Some(TaskAssignAction::Assign {
+                                            feature_id: feature_id.clone(),
+                                            user_id: member.id,
+                                            user_name: member.display_name.clone(),
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                    }
+                }
+                if !allow_assign {
+                    ui.colored_label(egui::Color32::GRAY, "Select the owner to change assignments.");
+                }
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    close_task_dialog = true;
+                }
+            });
+            if close_task_dialog {
+                self.task_assign_feature_id = None;
+                self.task_assign_feature_title.clear();
+            }
+        }
+        if let Some(user_id) = self.task_assign_user_id {
+            let mut close_task_dialog = false;
+            let user_name = self.task_assign_user_name.clone();
+            let owner_id = self.current_org_id.and_then(|oid| db_org_owner_id(&self.db, oid));
+            let allow_assign = self.org_settings.mode == "flat" || self.org_selected_user_id == owner_id;
+            let mut features: Vec<(String, String)> = Vec::new();
+            for quarter in &self.quarters {
+                for feature in &quarter.features {
+                    features.push((feature.id.clone(), feature.title.clone()));
+                }
+            }
+            egui::Window::new(format!("Assign Tasks to {}", user_name)).collapsible(false).resizable(false).show(ctx, |ui| {
+                if features.is_empty() {
+                    ui.colored_label(egui::Color32::GRAY, "No features available.");
+                } else {
+                    for (feature_id, feature_title) in &features {
+                        let assignments = db_load_task_assignments(&self.db, feature_id);
+                        let assigned = assignments.iter().find(|a| a.user_id == user_id).map(|a| a.id);
+                        ui.horizontal(|ui| {
+                            ui.label(feature_title);
+                            if let Some(assignment_id) = assigned {
+                                ui.colored_label(egui::Color32::GRAY, "Assigned");
+                                ui.add_enabled_ui(allow_assign, |ui| {
+                                    if ui.small_button("Unassign").clicked() {
+                                        task_assign_action = Some(TaskAssignAction::Unassign {
+                                            assignment_id,
+                                            user_name: user_name.clone(),
+                                        });
+                                    }
+                                });
+                            } else {
+                                ui.add_enabled_ui(allow_assign, |ui| {
+                                    if ui.small_button("Assign").clicked() {
+                                        task_assign_action = Some(TaskAssignAction::Assign {
+                                            feature_id: feature_id.clone(),
+                                            user_id,
+                                            user_name: user_name.clone(),
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                    }
+                }
+                if !allow_assign {
+                    ui.colored_label(egui::Color32::GRAY, "Select the owner to change assignments.");
+                }
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    close_task_dialog = true;
+                }
+            });
+            if close_task_dialog {
+                self.task_assign_user_id = None;
+                self.task_assign_user_name.clear();
+            }
+        }
+        if let Some(action) = task_assign_action {
+            match action {
+                TaskAssignAction::Assign { feature_id, user_id, user_name } => {
+                    db_assign_task(&self.db, &feature_id, user_id);
+                    self.status_text = format!("Assigned {}", user_name);
+                }
+                TaskAssignAction::Unassign { assignment_id, user_name } => {
+                    db_unassign_task(&self.db, assignment_id);
+                    self.status_text = format!("Unassigned {}", user_name);
+                }
+            }
+        }
+
+        if self.show_org_list_dialog {
+            let mut switch_id = None;
+            let mut delete_id = None;
+            egui::Window::new("Organizations").collapsible(false).resizable(false).show(ctx, |ui| {
+                if self.org_list.is_empty() {
+                    ui.label("No organizations.");
+                }
+                for org in &self.org_list.clone() {
+                    ui.horizontal(|ui| {
+                        let is_current = self.current_org_id == Some(org.id);
+                        if ui.selectable_label(is_current, &org.name).clicked() {
+                            switch_id = Some(org.id);
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            delete_id = Some(org.id);
+                        }
+                    });
+                }
+                ui.separator();
+                if ui.button("Cancel").clicked() {
+                    self.show_org_list_dialog = false;
+                }
+            });
+            if let Some(id) = delete_id {
+                self.save_snapshot();
+                db_delete_org(&self.db, id);
+                self.org_list = db_list_orgs(&self.db);
+                if self.current_org_id == Some(id) {
+                    self.current_org_id = self.org_list.first().map(|o| o.id);
+                    if let Some(oid) = self.current_org_id {
+                        self.org_members = db_load_org_users(&self.db, oid);
+                        self.org_chart_links = db_load_org_chart(&self.db, oid);
+                        self.org_settings = db_load_org_settings(&self.db, oid);
+                    } else {
+                        self.org_members.clear();
+                        self.org_chart_links.clear();
+                        self.org_settings = OrgSettings {
+                            org_id: 0,
+                            mode: "hierarchy".into(),
+                            updated_at: String::new(),
+                        };
+                        self.org_selected_user_id = None;
+                    }
+                }
+            }
+            if let Some(id) = switch_id {
+                self.current_org_id = Some(id);
+                self.org_members = db_load_org_users(&self.db, id);
+                self.org_chart_links = db_load_org_chart(&self.db, id);
+                self.org_settings = db_load_org_settings(&self.db, id);
+                self.org_selected_user_id = db_org_owner_id(&self.db, id);
+                self.show_org_list_dialog = false;
+            }
         }
 
         if self.show_open_dialog {
@@ -1679,7 +3173,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 700.0])
-            .with_title("allroads v1.2.0")
+            .with_title("allroads v1.3.0")
             .with_decorations(false)
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../icon.icns"))
