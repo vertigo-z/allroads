@@ -1,5 +1,6 @@
 <img align="center" width="100%" height="100%" src="img/allroads.png" alt="allroads interface">
-<img align="center" width="100%" height="100%" src="img/timeline.png" alt="allroads light mode">
+<img align="center" width="100%" height="100%" src="img/timeline.png" alt="allroads timeline">
+<img align="center" width="100%" height="100%" src="img/org-chart.png" alt="allroads org chart">
 
 
 ---
