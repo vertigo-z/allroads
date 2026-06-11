@@ -3559,7 +3559,7 @@ impl eframe::App for RoadmapApp {
             ui.horizontal(|ui| {
                 ui.label(&self.status_text);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.colored_label(egui::Color32::GRAY, "v2.0.0");
+                    ui.colored_label(egui::Color32::GRAY, "v2.0.1");
                 });
             });
         });
@@ -6113,7 +6113,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 700.0])
-            .with_title("allroads v2.0.0")
+            .with_title("Allroads v2.0.1")
             .with_decorations(false)
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../icon.icns"))
