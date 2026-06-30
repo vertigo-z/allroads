@@ -1,6 +1,6 @@
 [package]
 name = "allroads"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2024"
 description = "a collaborative rust-based roadmap viewer and project management tool"
 license = "MIT"
@@ -19,7 +19,7 @@ hmac = "0.12"
 sha2 = "0.10"
 serde_cbor = "0.11"
 serde_json = "1"
-sync_engine = { path = "sync" }
+sync_engine = { path = "lib" }
 url = "2"
 chacha20poly1305 = "0.10"
 
@@ -37,7 +37,7 @@ debug = false
 name = "Allroads"
 identifier = "com.vertigo.allroads.app"
 icon = ["icon.icns"]
-version = "2.0.1"
+version = "2.0.2"
 category = "Productivity"
 short_description = "roadmap planning tool"
 long_description = "a rust-based roadmap viewer and project management tool"
