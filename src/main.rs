@@ -208,16 +208,14 @@ fn populate_task_assignment_user_link_ids(conn: &Connection, changes: &mut Vec<C
         };
 
         let resolved_user = if let Some(user_id) = payload_user_id {
-            conn
-                .query_row(
+            conn.query_row(
                     "SELECT id, COALESCE(NULLIF(link_id, ''), 'usr-' || id) FROM org_user WHERE id = ?1 LIMIT 1;",
                     rusqlite::params![user_id],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                 )
                 .ok()
         } else if let Ok(assignment_id) = change.entity_id.parse::<i64>() {
-            conn
-                .query_row(
+            conn.query_row(
                     "
                     SELECT ta.user_id, COALESCE(NULLIF(ou.link_id, ''), 'usr-' || ou.id)
                     FROM task_assignment ta
@@ -938,7 +936,9 @@ CREATE TABLE IF NOT EXISTS quarter (
     roadmap_id INTEGER NOT NULL REFERENCES roadmap(id) ON DELETE CASCADE,
     year INTEGER NOT NULL,
     quarter INTEGER NOT NULL,
-    sort_order INTEGER NOT NULL
+    sort_order INTEGER NOT NULL,
+    status_view INTEGER NOT NULL DEFAULT 0,
+    hide_not_progressing INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS feature (
     id TEXT PRIMARY KEY,
@@ -1110,7 +1110,7 @@ fn save_key_to_keychain(key: &str) -> Result<(), String> {
 
 fn delete_key_from_keychain() -> Result<(), String> {
     let entry = keyring_entry();
-    entry.delete_password().map_err(|e| format!("Error deleting key from keychain: {}", e))
+    entry.delete_credential().map_err(|e| format!("Error deleting key from keychain: {}", e))
 }
 
 fn load_or_create_key_with_keychain(use_keychain: bool) -> Result<String, String> {
@@ -1148,7 +1148,24 @@ fn open_connection_at_path(path: &std::path::PathBuf, encrypted: bool, use_keych
     }
     conn.execute_batch(DB_SCHEMA).map_err(|e| e.to_string())?;
     conn.execute_batch("ALTER TABLE org_user ADD COLUMN is_ai INTEGER NOT NULL DEFAULT 0").ok();
+    conn.execute_batch("ALTER TABLE quarter ADD COLUMN status_view INTEGER NOT NULL DEFAULT 0").ok();
+    conn.execute_batch("ALTER TABLE quarter ADD COLUMN hide_not_progressing INTEGER NOT NULL DEFAULT 1").ok();
     Ok((conn, db_key))
+}
+
+fn copy_table(from: &Connection, to: &Connection, table: &str, cols: &[&str]) {
+    let collist = cols.join(", ");
+    let placeholders = cols.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let rows: Vec<Vec<rusqlite::types::Value>> = {
+        let mut stmt = from.prepare(&format!("SELECT {} FROM {}", collist, table)).unwrap();
+        stmt.query_map([], |row| {
+            (0..cols.len()).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect()
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    };
+    let sql = format!("INSERT INTO {} ({}) VALUES ({})", table, collist, placeholders);
+    for row in &rows {
+        to.execute(&sql, rusqlite::params_from_iter(row.iter())).unwrap();
+    }
 }
 
 fn db_list_roadmaps(conn: &Connection) -> Vec<(i64, String)> {
@@ -1194,14 +1211,14 @@ fn db_save_roadmap(conn: &Connection, roadmap_id: i64, quarters: &[Quarter]) {
     for (qi, q) in quarters.iter().enumerate() {
         let quarter_id = if let Some(id) = existing_quarters.get(&(q.year, q.quarter)) {
             conn.execute(
-                "UPDATE quarter SET sort_order = ?1 WHERE id = ?2",
-                rusqlite::params![qi as i64, id],
+                "UPDATE quarter SET sort_order = ?1, status_view = ?2, hide_not_progressing = ?3 WHERE id = ?4",
+                rusqlite::params![qi as i64, q.status_view as i32, q.hide_not_progressing as i32, id],
             ).unwrap();
             *id
         } else {
             conn.execute(
-                "INSERT INTO quarter (roadmap_id, year, quarter, sort_order) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![roadmap_id, q.year, q.quarter, qi as i64],
+                "INSERT INTO quarter (roadmap_id, year, quarter, sort_order, status_view, hide_not_progressing) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![roadmap_id, q.year, q.quarter, qi as i64, q.status_view as i32, q.hide_not_progressing as i32],
             ).unwrap();
             conn.last_insert_rowid()
         };
@@ -1292,13 +1309,13 @@ fn db_save_roadmap(conn: &Connection, roadmap_id: i64, quarters: &[Quarter]) {
 }
 
 fn db_load_roadmap(conn: &Connection, roadmap_id: i64) -> Vec<Quarter> {
-    let mut q_stmt = conn.prepare("SELECT id, year, quarter FROM quarter WHERE roadmap_id = ?1 ORDER BY sort_order").unwrap();
+    let mut q_stmt = conn.prepare("SELECT id, year, quarter, status_view, hide_not_progressing FROM quarter WHERE roadmap_id = ?1 ORDER BY sort_order").unwrap();
     let q_rows: Vec<_> = q_stmt.query_map(rusqlite::params![roadmap_id], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?))
+        Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?, row.get::<_, i32>(3)?, row.get::<_, i32>(4)?))
     }).unwrap().filter_map(|r| r.ok()).collect();
 
     let mut quarters = Vec::new();
-    for (qid, year, quarter) in q_rows {
+    for (qid, year, quarter, sv, hnp) in q_rows {
         let mut f_stmt = conn.prepare("SELECT id, title, description, completed, status, color, days, weeks, start_date, started_at, paused_at, completed_at FROM feature WHERE quarter_id = ?1 ORDER BY sort_order").unwrap();
         let features: Vec<Feature> = f_stmt.query_map(rusqlite::params![qid], |row| {
             let fid: String = row.get(0)?;
@@ -1343,7 +1360,7 @@ fn db_load_roadmap(conn: &Connection, roadmap_id: i64) -> Vec<Quarter> {
                 subtasks,
             })
         }).unwrap().filter_map(|r| r.ok()).collect();
-        quarters.push(Quarter { year, quarter, features });
+        quarters.push(Quarter { year, quarter, features, status_view: sv != 0, hide_not_progressing: hnp != 0 });
     }
     quarters
 }
@@ -1744,11 +1761,13 @@ struct Quarter {
     year: u32,
     quarter: u32,
     features: Vec<Feature>,
+    status_view: bool,
+    hide_not_progressing: bool,
 }
 
 impl Quarter {
     fn new(year: u32, quarter: u32) -> Self {
-        Self { year, quarter, features: Vec::new() }
+        Self { year, quarter, features: Vec::new(), status_view: false, hide_not_progressing: true }
     }
 
     fn name(&self) -> String {
@@ -1872,11 +1891,11 @@ impl FeatureDialogState {
         let mut ok = false;
         ui.vertical(|ui| {
             ui.label("Title:");
-            ui.add(egui::TextEdit::singleline(&mut self.title).desired_width(350.0));
+            ui.add(egui::TextEdit::singleline(&mut self.title).desired_width(380.0));
             ui.add_space(4.0);
 
             ui.label("Description:");
-            ui.add(egui::TextEdit::multiline(&mut self.description).desired_rows(6).desired_width(350.0));
+            ui.add(egui::TextEdit::multiline(&mut self.description).desired_rows(6).desired_width(380.0));
             ui.add_space(4.0);
 
             ui.label("Status:");
@@ -2262,6 +2281,8 @@ struct RoadmapApp {
     sync_pending_token: Arc<Mutex<Option<PendingTokenRotation>>>,
     pending_server_switch_url: Option<String>,
     completion_dialog: Option<CompletionDialogState>,
+    status_text_set_at: Option<std::time::Instant>,
+    status_text_value: Option<String>,
 }
 
 impl RoadmapApp {
@@ -2357,7 +2378,9 @@ impl RoadmapApp {
             sync_pending_send: Arc::new(AtomicBool::new(false)),
             sync_pending_token: Arc::new(Mutex::new(None)),
             pending_server_switch_url: None,
-            completion_dialog: None,
+                    completion_dialog: None,
+            status_text_set_at: None,
+            status_text_value: None,
         };
         if let Some((id, name)) = app.roadmap_list.first().cloned() {
             app.current_roadmap_id = Some(id);
@@ -2493,43 +2516,29 @@ impl RoadmapApp {
             let _ = std::fs::remove_file(&new_path);
         }
 
-        let mut roadmaps: Vec<(i64, String, String, String)> = Vec::new();
-        {
-            let mut stmt = self.db.prepare("SELECT id, name, created_at, updated_at FROM roadmap").unwrap();
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
-            for r in rows.flatten() { roadmaps.push(r); }
-        }
-
-        let mut quarters: Vec<(i64, i64, u32, u32, i64)> = Vec::new();
-        {
-            let mut stmt = self.db.prepare("SELECT id, roadmap_id, year, quarter, sort_order FROM quarter ORDER BY sort_order").unwrap();
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).unwrap();
-            for r in rows.flatten() { quarters.push(r); }
-        }
-
-        let mut features: Vec<(String, i64, String, String, i32, String, String, i64)> = Vec::new();
-        {
-            let mut stmt = self.db.prepare("SELECT id, quarter_id, title, description, completed, status, color, sort_order FROM feature ORDER BY sort_order").unwrap();
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))).unwrap();
-            for r in rows.flatten() { features.push(r); }
-        }
-
-        let old_db = std::mem::replace(&mut self.db, Connection::open_in_memory().unwrap());
-        drop(old_db);
-
         match open_connection_at_path(&new_path, want_encrypted, use_keychain) {
             Ok((new_conn, _)) => {
-                for (id, name, created, updated) in &roadmaps {
-                    new_conn.execute("INSERT INTO roadmap (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)", rusqlite::params![id, name, created, updated]).unwrap();
-                }
-                for (id, roadmap_id, year, quarter, sort_order) in &quarters {
-                    new_conn.execute("INSERT INTO quarter (id, roadmap_id, year, quarter, sort_order) VALUES (?1, ?2, ?3, ?4, ?5)", rusqlite::params![id, roadmap_id, year, quarter, sort_order]).unwrap();
-                }
-                for (id, quarter_id, title, desc, completed, status, color, sort_order) in &features {
-                    new_conn.execute("INSERT INTO feature (id, quarter_id, title, description, completed, status, color, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", rusqlite::params![id, quarter_id, title, desc, completed, status, color, sort_order]).unwrap();
-                }
+                new_conn.execute_batch("PRAGMA foreign_keys = OFF").ok();
+                copy_table(&self.db, &new_conn, "roadmap", &["id", "name", "created_at", "updated_at"]);
+                copy_table(&self.db, &new_conn, "quarter", &["id", "roadmap_id", "year", "quarter", "sort_order"]);
+                copy_table(&self.db, &new_conn, "feature", &["id", "quarter_id", "title", "description", "completed", "status", "color", "sort_order", "days", "weeks", "start_date", "started_at", "paused_at", "completed_at"]);
+                copy_table(&self.db, &new_conn, "subtask", &["id", "feature_id", "title", "description", "completed", "status", "color", "sort_order", "started_at", "completed_at"]);
+                copy_table(&self.db, &new_conn, "org", &["id", "name", "owner_token", "created_at", "updated_at"]);
+                copy_table(&self.db, &new_conn, "org_settings", &["org_id", "mode", "updated_at"]);
+                copy_table(&self.db, &new_conn, "org_sync", &["org_id", "joined", "is_owner", "token", "owner_token", "updated_at"]);
+                copy_table(&self.db, &new_conn, "org_user", &["id", "link_id", "org_id", "display_name", "role", "is_ai", "created_at", "updated_at"]);
+                copy_table(&self.db, &new_conn, "org_owner", &["org_id", "owner_user_id", "created_at"]);
+                copy_table(&self.db, &new_conn, "org_roadmap", &["org_id", "roadmap_id", "created_at"]);
+                copy_table(&self.db, &new_conn, "org_chart", &["id", "org_id", "manager_id", "report_id", "created_at"]);
+                copy_table(&self.db, &new_conn, "org_roadmap_editor", &["org_id", "user_id", "can_edit", "updated_at"]);
+                copy_table(&self.db, &new_conn, "task_assignment", &["id", "feature_id", "user_id", "user_link_id", "status", "assigned_at", "updated_at"]);
+                copy_table(&self.db, &new_conn, "sync_config", &["id", "node_id", "server_url", "server_node_id", "use_proxy", "proxy_mode", "proxy_url"]);
+                new_conn.execute_batch("PRAGMA foreign_keys = ON").ok();
 
                 new_conn.close().unwrap();
+
+                let old_db = std::mem::replace(&mut self.db, Connection::open_in_memory().unwrap());
+                drop(old_db);
 
                 let old_path = db_path();
                 let _ = std::fs::remove_file(&old_path);
@@ -2541,6 +2550,11 @@ impl RoadmapApp {
                         self.db = conn;
                         self.db_key = key;
                         self.roadmap_list = db_list_roadmaps(&self.db);
+                        self.org_list = db_list_orgs(&self.db);
+                        if let Some(org_id) = self.current_org_id {
+                            self.org_members = db_load_org_users(&self.db, org_id);
+                            self.org_chart_links = db_load_org_chart(&self.db, org_id);
+                        }
                         self.status_text = if self.encrypted { "Encryption enabled".into() } else { "Encryption disabled".into() };
                     }
                     Err(e) => {
@@ -3277,10 +3291,15 @@ impl RoadmapApp {
         self.save_snapshot();
         let now = chrono::Local::now().to_rfc3339();
         let feature = &mut self.quarters[qi].features[fi];
-        feature.completed_at = Some(now);
+        feature.completed_at = Some(now.clone());
         feature.completed = true;
         feature.status = "Completed".into();
         feature.description = notes;
+        for subtask in feature.subtasks.iter_mut() {
+            subtask.completed = true;
+            subtask.status = "Completed".into();
+            subtask.completed_at = Some(now.clone());
+        }
         self.status_text = format!("Completed: {}", feature.title);
     }
 
@@ -3380,9 +3399,30 @@ fn feature_duration_days(f: &Feature) -> u32 {
 }
 
 impl eframe::App for RoadmapApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_sync_events();
-        egui::TopBottomPanel::top("title_bar").show(ctx, |ui| {
+        let now = std::time::Instant::now();
+        if self.status_text != "Ready" {
+            let need_reset = match &self.status_text_value {
+                None => true,
+                Some(v) => v != &self.status_text,
+            };
+            if need_reset {
+                self.status_text_set_at = Some(now);
+                self.status_text_value = Some(self.status_text.clone());
+            } else if let Some(set_at) = self.status_text_set_at {
+                if now.duration_since(set_at) >= std::time::Duration::from_secs(10) {
+                    self.status_text = "Ready".into();
+                    self.status_text_set_at = None;
+                    self.status_text_value = None;
+                }
+            }
+        } else {
+            self.status_text_set_at = None;
+            self.status_text_value = None;
+        }
+        let ctx = ui.ctx().clone();
+        egui::Panel::top("title_bar").show(ui, |ui| {
             let available = ui.available_rect_before_wrap();
             let drag_rect = available.intersect(ui.max_rect());
             let drag_response = ui.interact(drag_rect, ui.id().with("drag_area"), egui::Sense::drag());
@@ -3403,24 +3443,24 @@ impl eframe::App for RoadmapApp {
                 }
             });
 
-            egui::menu::bar(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.label(egui::RichText::new("allroads").strong().size(14.0));
                 ui.add_space(16.0);
                 ui.menu_button("File", |ui| {
-                    if ui.button("New").clicked() { self.show_new_dialog = true; ui.close_menu(); }
-                    if ui.button("Open").clicked() { self.open_roadmap(); ui.close_menu(); }
-                    if ui.button("Save").clicked() { self.save_roadmap(); ui.close_menu(); }
+                    if ui.button("New").clicked() { self.show_new_dialog = true; ui.close(); }
+                    if ui.button("Open").clicked() { self.open_roadmap(); ui.close(); }
+                    if ui.button("Save").clicked() { self.save_roadmap(); ui.close(); }
                     if ui.button("Exit").clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
                     ui.separator();
                     ui.menu_button("Templates", |ui| {
-                        if ui.button("Web Application").clicked() { self.load_template("web"); ui.close_menu(); }
-                        if ui.button("Mobile App").clicked() { self.load_template("mobile"); ui.close_menu(); }
-                        if ui.button("API Development").clicked() { self.load_template("api"); ui.close_menu(); }
+                        if ui.button("Web Application").clicked() { self.load_template("web"); ui.close(); }
+                        if ui.button("Mobile App").clicked() { self.load_template("mobile"); ui.close(); }
+                        if ui.button("API Development").clicked() { self.load_template("api"); ui.close(); }
                     });
                 });
                 ui.menu_button("Edit", |ui| {
-                    if ui.button("Undo").clicked() { self.undo(); ui.close_menu(); }
-                    if ui.button("Redo").clicked() { self.redo(); ui.close_menu(); }
+                    if ui.button("Undo").clicked() { self.undo(); ui.close(); }
+                    if ui.button("Redo").clicked() { self.redo(); ui.close(); }
                     ui.separator();
                     if ui.button("Rename Roadmap").clicked() {
                         if let Some(id) = self.current_roadmap_id {
@@ -3429,7 +3469,7 @@ impl eframe::App for RoadmapApp {
                                 self.rename_roadmap_name = name;
                             }
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     ui.menu_button("Encryption", |ui| {
@@ -3452,16 +3492,16 @@ impl eframe::App for RoadmapApp {
                     ui.menu_button("Organizations", |ui| {
                         if ui.button("Switch").clicked() {
                             self.show_org_list_dialog = true;
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Create").clicked() {
                             self.org_dialog_state = OrgDialogState::CreateOrg { name: String::new() };
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                         if ui.button("Join").clicked() {
                             self.org_dialog_state = OrgDialogState::JoinOrg { token: String::new() };
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Settings").clicked() {
                             if let Some(org_id) = self.current_org_id {
@@ -3492,33 +3532,43 @@ impl eframe::App for RoadmapApp {
                             } else {
                                 self.status_text = "No organization selected".into();
                             }
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                     ui.separator();
                     if ui.button("Open Shared Roadmap").clicked() {
                         self.org_dialog_state = OrgDialogState::JoinSharedRoadmap { token: String::new() };
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Share Current Roadmap").clicked() {
                         self.org_dialog_state = OrgDialogState::ShareCurrentRoadmap;
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    if ui.button("Timeline").clicked() { self.switch_tab(Some("Timeline")); ui.close_menu(); }
-                    if ui.button("Org Chart").clicked() { self.switch_tab(Some("Org Chart")); ui.close_menu(); }
-                    if ui.button("Quarters").clicked() { self.switch_tab(Some("Quarters")); ui.close_menu(); }
+                    if ui.button("Timeline").clicked() { self.switch_tab(Some("Timeline")); ui.close(); }
+                    if ui.button("Org Chart").clicked() { self.switch_tab(Some("Org Chart")); ui.close(); }
+                    if ui.button("Quarters").clicked() { self.switch_tab(Some("Quarters")); ui.close(); }
                     ui.separator();
                     ui.checkbox(&mut self.show_timeline_labels, "Show Labels");
+                    ui.separator();
+                    ui.menu_button("Quarters", |ui| {
+                        let mut all_sv = self.quarters.iter().all(|q| q.status_view);
+                        if ui.checkbox(&mut all_sv, "View by Status").changed() {
+                            for q in &mut self.quarters { q.status_view = all_sv; }
+                        }
+                        let mut all_hide = self.quarters.iter().all(|q| q.hide_not_progressing);
+                        if ui.checkbox(&mut all_hide, "Hide Not Progressing").changed() {
+                            for q in &mut self.quarters { q.hide_not_progressing = all_hide; }
+                        }
+                    });
                 });
                 ui.menu_button("Network", |ui| {
                     if ui.checkbox(&mut self.offline, "Offline Mode").changed() {
                         if !self.offline && !self.encrypted {
                             self.offline = true;
                             self.status_text = "Enable encryption before networking".into();
-                        }
-                        if self.offline {
+                        } else if self.offline {
                             self.status_text = "Disabled networking".into();
                             self.stop_sync_worker();
                         } else {
@@ -3530,18 +3580,18 @@ impl eframe::App for RoadmapApp {
                         self.network_edit_config = self.sync_config.clone();
                         self.network_settings_view = NetworkSettingsView::Proxy;
                         self.show_network_settings = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Server").clicked() {
                         self.network_edit_config = self.sync_config.clone();
                         self.network_settings_view = NetworkSettingsView::Server;
                         self.show_network_settings = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Sync now").clicked() {
                         self.sync_now();
-                        ui.close_menu();
+                        ui.close();
                     }
                 }); 
 
@@ -3556,16 +3606,16 @@ impl eframe::App for RoadmapApp {
             });
         });
 
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+        egui::Panel::bottom("status_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status_text);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.colored_label(egui::Color32::GRAY, "v2.0.2");
+                    ui.colored_label(egui::Color32::GRAY, "v2.1.0");
                 });
             });
         });
 
-        egui::TopBottomPanel::top("controls").show(ctx, |ui| {
+        egui::Panel::top("controls").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(&self.current_tab);
                 ui.add_space(10.0);
@@ -3575,7 +3625,7 @@ impl eframe::App for RoadmapApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if self.current_tab == "Quarters" {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let mut dialog_action: Option<DialogAction> = None;
@@ -3585,7 +3635,10 @@ impl eframe::App for RoadmapApp {
                     let mut move_up_action: Option<(usize, usize)> = None;
                     let mut move_down_action: Option<(usize, usize)> = None;
                     let mut complete_action: Option<(usize, usize)> = None;
+                    let mut start_action: Option<(usize, usize)> = None;
+                    let mut pause_action: Option<(usize, usize)> = None;
                     let mut quarter_remove_idx: Option<usize> = None;
+                    let mut status_move_action: Option<(usize, usize, i32)> = None;
                     let member_name_by_id: std::collections::HashMap<i64, String> = self
                         .org_members
                         .iter()
@@ -3593,19 +3646,21 @@ impl eframe::App for RoadmapApp {
                         .collect();
 
                     for (qi, quarter) in &mut self.quarters.iter_mut().enumerate() {
+                        let is_status_view = quarter.status_view;
+                        let hide_np = quarter.hide_not_progressing;
                         egui::Frame::group(ui.style())
                             .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 180, 180)))
                             .show(ui, |ui| {
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
                                         ui.heading(quarter.name());
+                                        ui.label(quarter.date_range());
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             if ui.small_button("x").clicked() {
                                                 quarter_remove_idx = Some(qi);
                                             }
                                         });
                                     });
-                                    ui.label(quarter.date_range());
                                     ui.separator();
 
                                     if ui.button("+ Add Feature").clicked() {
@@ -3613,6 +3668,128 @@ impl eframe::App for RoadmapApp {
                                     }
 
                                     ui.add_space(4.0);
+
+                                    if is_status_view {
+                                        let col_labels = ["Planned", "Developing", "Testing", "Completed", "Not Progressing"];
+                                        let num_cols = if hide_np { 4 } else { 5 };
+                                        let status_col = |s: &str| -> usize {
+                                            match s {
+                                                "Planned" => 0,
+                                                "Developing" => 1,
+                                                "Testing" => 2,
+                                                "Completed" => 3,
+                                                _ => 4,
+                                            }
+                                        };
+                                        let total_w = ui.available_width();
+                                        let col_w = (total_w - num_cols as f32 * 7.0) / num_cols as f32;
+                                        ui.horizontal(|ui| {
+                                            for col in 0..num_cols {
+                                                let count = quarter.features.iter().filter(|f| status_col(&f.status) == col).count();
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(col_w, ui.available_height()),
+                                                    egui::Layout::top_down_justified(egui::Align::LEFT),
+                                                    |ui| {
+                                                        egui::Frame::new()
+                                                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 180)))
+                                                            .inner_margin(6.0)
+                                                            .show(ui, |ui| {
+                                                                ui.set_min_width(col_w - 16.0);
+                                                                ui.heading(format!("{} ({})", col_labels[col], count));
+                                                                ui.separator();
+                                                                for (fi, feature) in quarter.features.iter().enumerate() {
+                                                                    if status_col(&feature.status) != col { continue; }
+                                                                    let color = parse_color(&feature.color);
+                                                                    let feature_id = feature.id.clone();
+                                                                    let feature_title = feature.title.clone();
+                                                                    let feature_desc = feature.description.clone();
+                                                                    let mut time_parts = Vec::new();
+                                                                    if let Some(w) = feature.weeks { time_parts.push(format!("{}w", w)); }
+                                                                    if let Some(d) = feature.days { time_parts.push(format!("{}d", d)); }
+                                                                    let assigned = {
+                                                                        let assignments = db_load_task_assignments(&self.db, &feature.id);
+                                                                        let mut names: Vec<String> = assignments.iter().filter_map(|a| member_name_by_id.get(&a.user_id).cloned()).collect();
+                                                                        names.sort(); names.dedup();
+                                                                        names.join(", ")
+                                                                    };
+                                                                     let card_resp = egui::Frame::new()
+                                                                         .stroke(egui::Stroke::new(0.5, egui::Color32::from_rgb(200, 200, 200)))
+                                                                         .inner_margin(4.0)
+                                                                         .show(ui, |ui| {
+                                                                             let card_w = col_w - 26.0;
+                                                                             ui.set_min_width(card_w);
+                                                                             ui.set_max_width(card_w);
+                                                                             ui.horizontal(|ui| {
+                                                                                 let (rect, _) = ui.allocate_exact_size(egui::vec2(4.0, 16.0), egui::Sense::hover());
+                                                                                 ui.painter().rect_filled(rect, 0.0, color);
+                                                                                 let btn_w = 28.0 * (1 + (col > 0) as u32 + (col < num_cols - 1) as u32) as f32;
+                                                                                 let title_w = (card_w - 12.0 - btn_w).max(20.0);
+                                                                                  ui.allocate_ui_with_layout(egui::vec2(title_w, 16.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                                                      ui.set_min_width(title_w);
+                                                                                      ui.set_max_width(title_w);
+                                                                                      let title_display: String = if feature.title.chars().count() > 30 { feature.title.chars().take(30).collect::<String>() + "..." } else { feature.title.clone() };
+                                                                                      if feature.completed {
+                                                                                          ui.add(egui::Label::new(egui::RichText::new(title_display).color(egui::Color32::GRAY)).truncate());
+                                                                                      } else {
+                                                                                          ui.add(egui::Label::new(title_display).truncate());
+                                                                                      }
+                                                                                  });
+                                                                                 if col > 0 {
+                                                                                     if ui.small_button("<").clicked() {
+                                                                                         status_move_action = Some((qi, fi, -1));
+                                                                                     }
+                                                                                 }
+                                                                                 if col < num_cols - 1 {
+                                                                                     if ui.small_button(">").clicked() {
+                                                                                         status_move_action = Some((qi, fi, 1));
+                                                                                     }
+                                                                                 }
+                                                                                 if ui.small_button("Edit").clicked() {
+                                                                                     dialog_action = Some(DialogAction::OpenEditFeature(qi, fi));
+                                                                                 }
+                                                                             });
+                                                                            if !feature_desc.trim().is_empty() {
+                                                                                ui.add(egui::Label::new(egui::RichText::new(&feature_desc).color(egui::Color32::GRAY).size(11.0)).truncate());
+                                                                            }
+                                                                            ui.horizontal(|ui| {
+                                                                                if !time_parts.is_empty() {
+                                                                                    ui.label(egui::RichText::new(time_parts.join(" ")).color(egui::Color32::GRAY).size(11.0));
+                                                                                }
+                                                                                if !assigned.is_empty() {
+                                                                                    ui.label(egui::RichText::new(assigned).color(egui::Color32::from_rgb(0, 188, 212)).size(11.0));
+                                                                                }
+                                                                            });
+                                                                        });
+                                                                    card_resp.response.context_menu(|ui| {
+                                                                        if ui.button("Start").clicked() {
+                                                                            start_action = Some((qi, fi));
+                                                                            ui.close();
+                                                                        }
+                                                                        if ui.button("Pause").clicked() {
+                                                                            pause_action = Some((qi, fi));
+                                                                            ui.close();
+                                                                        }
+                                                                        ui.separator();
+                                                                        if ui.button("Delete Feature").clicked() {
+                                                                            remove_action = Some((qi, fi));
+                                                                            ui.close();
+                                                                        }
+                                                                        if ui.button("Add Subtask").clicked() {
+                                                                            dialog_action = Some(DialogAction::OpenAddSubtask(qi, fi));
+                                                                            ui.close();
+                                                                        }
+                                                                        if ui.button("Assign Task").clicked() {
+                                                                            self.task_assign_feature_id = Some(feature_id.clone());
+                                                                            self.task_assign_feature_title = feature_title.clone();
+                                                                            ui.close();
+                                                                        }
+                                                                    });
+                                                                }
+                                                            });
+                                                    });
+                                            }
+                                        });
+                                    } else {
 
                                     for (fi, feature) in quarter.features.iter().enumerate() {
                                         let assigned_display = {
@@ -3637,6 +3814,7 @@ impl eframe::App for RoadmapApp {
                                             let available = ui.available_width();
                                             let feature_id = feature.id.clone();
                                             let feature_title = feature.title.clone();
+                                            let feature_status = feature.status.clone();
                                             let response = ui.allocate_ui(egui::vec2(available, 36.0), |ui| {
                                                 ui.horizontal(|ui| {
                                                     let color = parse_color(&feature.color);
@@ -3652,13 +3830,33 @@ impl eframe::App for RoadmapApp {
                                                         ui.label(&feature.title);
                                                     }
 
-                                                    let status_color = if feature.completed {
-                                                        egui::Color32::from_rgb(76, 175, 80)
-                                                    } else {
-                                                        egui::Color32::from_rgb(180, 180, 180)
+                                                    let status_color = match feature.status.as_str() {
+                                                        "Completed" => egui::Color32::from_rgb(76, 175, 80),
+                                                        "Developing" => egui::Color32::from_rgb(0, 188, 212),
+                                                        "Testing" => egui::Color32::from_rgb(138, 43, 226),
+                                                        "Planned" => egui::Color32::from_rgb(180, 180, 180),
+                                                        "Stalled" => egui::Color32::from_rgb(255, 152, 0),
+                                                        "Paused" => egui::Color32::from_rgb(156, 39, 176),
+                                                        "Cancelled" => egui::Color32::from_rgb(244, 67, 54),
+                                                        "Deferred" => egui::Color32::from_rgb(121, 85, 72),
+                                                        _ => egui::Color32::from_rgb(180, 180, 180),
                                                     };
-                                                    ui.colored_label(status_color, format!("[{}]", feature.status));
-                                                    ui.colored_label(egui::Color32::GRAY, &feature.description);
+                                                    let status_text: egui::RichText = if feature.status == "Completed" {
+                                                        egui::RichText::new("\u{2714}")
+                                                    } else {
+                                                        egui::RichText::new(format!("[{}]", feature.status))
+                                                    };
+                                                    ui.colored_label(status_color, status_text);
+
+                                                    let right_reserve = 300.0 + if assigned_display.is_empty() { 0.0 } else { assigned_display.len() as f32 * 8.0 + 20.0 };
+                                                    let desc_width = (ui.available_width() - right_reserve).max(20.0);
+                                                    ui.allocate_ui_with_layout(
+                                                        egui::vec2(desc_width, 16.0),
+                                                        egui::Layout::left_to_right(egui::Align::Center),
+                                                        |ui| {
+                                                            ui.add(egui::Label::new(egui::RichText::new(&feature.description).color(egui::Color32::GRAY)).truncate());
+                                                        },
+                                                    );
 
                                                     let mut time_parts = Vec::new();
                                                     if let Some(w) = feature.weeks { time_parts.push(format!("{}w", w)); }
@@ -3686,19 +3884,32 @@ impl eframe::App for RoadmapApp {
                                                     });
                                                 });
                                             }).response;
-                                            response.context_menu(|ui| {
+                                            response.interact(egui::Sense::click()).context_menu(|ui| {
+                                                if feature_status == "Planned" || feature_status == "Paused" || feature_status == "Stalled" || feature_status == "Blocked" {
+                                                    if ui.button("Start").clicked() {
+                                                        start_action = Some((qi, fi));
+                                                        ui.close();
+                                                    }
+                                                }
+                                                if feature_status == "Developing" {
+                                                    if ui.button("Pause").clicked() {
+                                                        pause_action = Some((qi, fi));
+                                                        ui.close();
+                                                    }
+                                                }
+                                                ui.separator();
                                                 if ui.button("Delete Feature").clicked() {
                                                     remove_action = Some((qi, fi));
-                                                    ui.close_menu();
+                                                    ui.close();
                                                 }
                                                 if ui.button("Add Subtask").clicked() {
                                                     dialog_action = Some(DialogAction::OpenAddSubtask(qi, fi));
-                                                    ui.close_menu();
+                                                    ui.close();
                                                 }
                                                 if ui.button("Assign Task").clicked() {
                                                     self.task_assign_feature_id = Some(feature_id.clone());
                                                     self.task_assign_feature_title = feature_title.clone();
-                                                    ui.close_menu();
+                                                    ui.close();
                                                 }
                                             });
                                         });
@@ -3725,10 +3936,16 @@ impl eframe::App for RoadmapApp {
                                                         if si > 0 {
                                                             ui.add_space(row_gap);
                                                         }
-                                                        let subtask_status_color = if subtask.completed {
-                                                            egui::Color32::from_rgb(76, 175, 80)
-                                                        } else {
-                                                            egui::Color32::from_rgb(160, 160, 160)
+                                                        let subtask_status_color = match subtask.status.as_str() {
+                                                            "Completed" => egui::Color32::from_rgb(76, 175, 80),
+                                                            "Developing" => egui::Color32::from_rgb(0, 188, 212),
+                                                            "Testing" => egui::Color32::from_rgb(138, 43, 226),
+                                                            "Planned" => egui::Color32::from_rgb(160, 160, 160),
+                                                            "Stalled" => egui::Color32::from_rgb(255, 152, 0),
+                                                            "Paused" => egui::Color32::from_rgb(156, 39, 176),
+                                                            "Cancelled" => egui::Color32::from_rgb(244, 67, 54),
+                                                            "Deferred" => egui::Color32::from_rgb(121, 85, 72),
+                                                            _ => egui::Color32::from_rgb(160, 160, 160),
                                                         };
                                                         let response = ui.allocate_ui(egui::vec2(ui.available_width(), row_height), |ui| {
                                                             egui::Frame::NONE
@@ -3744,7 +3961,12 @@ impl eframe::App for RoadmapApp {
                                                                     let task_color = parse_color(&subtask.color);
                                                                     ui.painter().rect_filled(rect, 0.0, task_color);
                                                                         ui.label(&subtask.title);
-                                                                        ui.colored_label(subtask_status_color, format!("[{}]", subtask.status));
+                                                                        let subtask_text: egui::RichText = if subtask.status == "Completed" {
+                                                                            egui::RichText::new("\u{2714}")
+                                                                        } else {
+                                                                            egui::RichText::new(format!("[{}]", subtask.status))
+                                                                        };
+                                                                        ui.colored_label(subtask_status_color, subtask_text);
                                                                         if !subtask.description.trim().is_empty() {
                                                                             ui.colored_label(egui::Color32::GRAY, &subtask.description);
                                                                         }
@@ -3787,6 +4009,7 @@ impl eframe::App for RoadmapApp {
                                             });
                                             ui.add_space(8.0);
                                         }
+                                    }
                                     }
                                 });
                             });
@@ -3835,6 +4058,40 @@ impl eframe::App for RoadmapApp {
 
                     if let Some((qi, fi)) = complete_action {
                         self.complete_task(qi, fi);
+                    }
+
+                    if let Some((qi, fi)) = start_action {
+                        self.start_task(qi, fi);
+                    }
+                    if let Some((qi, fi)) = pause_action {
+                        self.pause_task(qi, fi);
+                    }
+
+                    if let Some((qi, fi, dir)) = status_move_action {
+                        self.save_snapshot();
+                        let feature = &mut self.quarters[qi].features[fi];
+                        let col = match feature.status.as_str() {
+                            "Planned" => 0usize,
+                            "Developing" => 1,
+                            "Testing" => 2,
+                            "Completed" => 3,
+                            _ => 4,
+                        };
+                        let new_col = (col as i32 + dir).clamp(0, 4) as usize;
+                        feature.status = match new_col {
+                            0 => "Planned".into(),
+                            1 => "Developing".into(),
+                            2 => "Testing".into(),
+                            3 => "Completed".into(),
+                            _ => "Stalled".into(),
+                        };
+                        if new_col == 3 {
+                            feature.completed = true;
+                            feature.completed_at = Some(chrono::Local::now().to_rfc3339());
+                        } else if feature.completed && new_col != 3 {
+                            feature.completed = false;
+                            feature.completed_at = None;
+                        }
                     }
 
                     if let Some(action) = dialog_action {
@@ -3966,7 +4223,7 @@ impl eframe::App for RoadmapApp {
                         ui.label("Invalid date range.");
                     } else {
                         if ui.input(|i| i.pointer.primary_down()) == false {
-                            let scroll = ui.input(|i| i.raw_scroll_delta);
+                            let scroll = ui.input(|i| i.smooth_scroll_delta);
                             self.timeline_scroll -= scroll.x;
                             let zoom_delta = ui.input(|i| i.zoom_delta());
                             if zoom_delta != 1.0 {
@@ -4194,7 +4451,7 @@ impl eframe::App for RoadmapApp {
                                         .fixed_pos(tooltip_pos)
                                         .order(egui::Order::Foreground);
                                     let area_resp = area
-                                        .show(ctx, |ui| {
+                                        .show(&ctx, |ui| {
                                             ui.set_min_width(240.0);
                                             let frame = egui::Frame::popup(ui.style());
                                             frame.show(ui, |ui| {
@@ -4205,7 +4462,8 @@ impl eframe::App for RoadmapApp {
                                                     ui.add_space(4.0);
 
                                                     let status_color = match f_status.as_str() {
-                                                        "Developing" => egui::Color32::from_rgb(76, 175, 80),
+                                                        "Developing" => egui::Color32::from_rgb(0, 188, 212),
+                                                        "Testing" => egui::Color32::from_rgb(138, 43, 226),
                                                         "Completed" => egui::Color32::from_rgb(33, 150, 243),
                                                         "Paused" => egui::Color32::from_rgb(255, 152, 0),
                                                         _ => egui::Color32::from_rgb(180, 180, 180),
@@ -4529,30 +4787,48 @@ impl eframe::App for RoadmapApp {
                             (tree_min_x + tree_max_x) / 2.0
                         };
 
+                        let mut wheel_lines: f32 = 0.0;
+                        let mut has_line_wheel = false;
+                        ui.ctx().input(|i| {
+                            for ev in &i.raw.events {
+                                if let egui::Event::MouseWheel { delta, unit, .. } = ev {
+                                    match unit {
+                                        egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => {
+                                            has_line_wheel = true;
+                                            wheel_lines += delta.y;
+                                        }
+                                        egui::MouseWheelUnit::Point => {}
+                                    }
+                                }
+                            }
+                        });
+
                         if !ui.input(|i| i.pointer.primary_down()) {
-                            let sd = ui.input(|i| i.raw_scroll_delta);
-                            self.org_chart_scroll -= sd.y * 0.8;
-                            self.org_chart_scroll_x += sd.x * 0.8;
+                            if has_line_wheel {
+                                let factor = 1.1_f32.powf(wheel_lines);
+                                self.org_chart_zoom = (self.org_chart_zoom * factor).clamp(0.65, 3.0);
+                            } else {
+                                let sd = ui.input(|i| i.smooth_scroll_delta);
+                                self.org_chart_scroll -= sd.y * 0.8;
+                                self.org_chart_scroll_x += sd.x * 0.8;
+                            }
                             let zoom_delta = ui.input(|i| i.zoom_delta());
                             if zoom_delta != 1.0 {
                                 self.org_chart_zoom = (self.org_chart_zoom * zoom_delta).clamp(0.65, 3.0);
                             }
                         }
-                        ui.ctx().input(|i| {
-                            for ev in &i.raw.events {
-                                if let egui::Event::MouseWheel { delta, .. } = ev {
-                                    self.org_chart_scroll -= delta.y * 0.8;
-                                    self.org_chart_scroll_x += delta.x * 0.8;
-                                }
-                            }
-                        });
 
                         let zoom = self.org_chart_zoom;
                         let (response, painter) = ui.allocate_painter(
                             ui.available_size(),
-                            egui::Sense::click(),
+                            egui::Sense::click_and_drag(),
                         );
                         let rect = response.rect;
+                        if response.dragged_by(egui::PointerButton::Primary) {
+                            let d = response.drag_delta();
+                            self.org_chart_scroll -= d.y;
+                            self.org_chart_scroll_x += d.x;
+                        }
                         let view_cx = rect.center().x;
                         let view_top = rect.top() + 30.0;
 
@@ -4851,15 +5127,6 @@ impl eframe::App for RoadmapApp {
                                     });
                                 });
 
-                            let menu_area = ui.ctx().memory(|m| m.area_rect(egui::Id::new("org_ctx_menu")));
-                            if let Some(mr) = menu_area {
-                                let mouse = ui.ctx().input(|i| i.pointer.latest_pos().unwrap_or(egui::pos2(-9999.0, -9999.0)));
-                                let anchor = self.org_right_click_pos.unwrap_or(egui::pos2(-9999.0, -9999.0));
-                                if !mr.contains(mouse) && ((mouse.x - anchor.x).abs() > 80.0 || (mouse.y - anchor.y).abs() > 80.0) {
-                                    close_menu = true;
-                                }
-                            }
-
                             if close_menu || ui.ctx().input(|i| i.pointer.primary_clicked()) {
                                 self.org_right_click_target = None;
                             }
@@ -4872,7 +5139,7 @@ impl eframe::App for RoadmapApp {
                                 .filter(|m| m.id != move_uid)
                                 .map(|m| (m.id, m.display_name.clone()))
                                 .collect();
-                            egui::Window::new(format!("Move {} under...", move_name)).collapsible(false).resizable(false).show(ctx, |ui| {
+                            egui::Window::new(format!("Move {} under...", move_name)).collapsible(false).resizable(false).show(&ctx, |ui| {
                                 if candidates.is_empty() {
                                     ui.colored_label(egui::Color32::GRAY, "No other members.");
                                 }
@@ -4934,7 +5201,7 @@ impl eframe::App for RoadmapApp {
         match &mut self.dialog_state {
             DialogState::AddFeature { quarter_idx, dialog } => {
                 let qi = *quarter_idx;
-                egui::Window::new("Add Feature").default_width(350.0).collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Add Feature").default_width(380.0).collapsible(false).resizable(false).show(&ctx, |ui| {
                     if dialog.show(ui) {
                         if let Some(feat) = dialog.to_feature(&format!("f_{}", rand::random::<u64>())) {
                             self.undo_stack.push(AppSnapshot {
@@ -4960,7 +5227,7 @@ impl eframe::App for RoadmapApp {
                 let (qi, fi) = (*quarter_idx, *feature_idx);
                 let existing_id = self.quarters[qi].features[fi].id.clone();
                 let existing_subtasks = self.quarters[qi].features[fi].subtasks.clone();
-                egui::Window::new("Edit Feature").default_width(350.0).collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Edit Feature").default_width(380.0).collapsible(false).resizable(false).show(&ctx, |ui| {
                     if dialog.show(ui) {
                         if let Some(feat) = dialog.to_feature(&existing_id) {
                             self.undo_stack.push(AppSnapshot {
@@ -4985,7 +5252,7 @@ impl eframe::App for RoadmapApp {
             }
             DialogState::AddSubtask { quarter_idx, feature_idx, dialog } => {
                 let (qi, fi) = (*quarter_idx, *feature_idx);
-                egui::Window::new("Add Subtask").default_width(420.0).collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Add Subtask").default_width(420.0).collapsible(false).resizable(false).show(&ctx, |ui| {
                     if dialog.show(ui) {
                         if let Some(task) = dialog.to_subtask(&format!("s_{}", rand::random::<u64>())) {
                             self.undo_stack.push(AppSnapshot {
@@ -5009,7 +5276,7 @@ impl eframe::App for RoadmapApp {
             DialogState::EditSubtask { quarter_idx, feature_idx, subtask_idx, dialog } => {
                 let (qi, fi, si) = (*quarter_idx, *feature_idx, *subtask_idx);
                 let existing_id = self.quarters[qi].features[fi].subtasks[si].id.clone();
-                egui::Window::new("Edit Subtask").default_width(420.0).collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Edit Subtask").default_width(420.0).collapsible(false).resizable(false).show(&ctx, |ui| {
                     if dialog.show(ui) {
                         if let Some(task) = dialog.to_subtask(&existing_id) {
                             self.undo_stack.push(AppSnapshot {
@@ -5053,7 +5320,7 @@ impl eframe::App for RoadmapApp {
             egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     ui.label("Completion notes (replaces description in Quarters view):");
                     ui.add(
                         egui::TextEdit::multiline(&mut dialog.notes)
@@ -5101,7 +5368,7 @@ impl eframe::App for RoadmapApp {
         let mut org_action: Option<OrgAction> = None;
         match &mut self.org_dialog_state {
             OrgDialogState::CreateOrg { name } => {
-                egui::Window::new("Create Organization").collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Create Organization").collapsible(false).resizable(false).show(&ctx, |ui| {
                     ui.label("Organization name:");
                     ui.text_edit_singleline(name);
                     ui.horizontal(|ui| {
@@ -5119,7 +5386,7 @@ impl eframe::App for RoadmapApp {
             }
             OrgDialogState::AddMember { display_name, role, report_to } => {
                 let members_snapshot = self.org_members.clone();
-                egui::Window::new("Add Member").collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Add Member").collapsible(false).resizable(false).show(&ctx, |ui| {
                     ui.label("Display name:");
                     ui.text_edit_singleline(display_name);
                     ui.label("Role:");
@@ -5165,7 +5432,7 @@ impl eframe::App for RoadmapApp {
             }
             OrgDialogState::EditMember { user_id, display_name, role } => {
                 let uid = *user_id;
-                egui::Window::new("Edit Member").collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Edit Member").collapsible(false).resizable(false).show(&ctx, |ui| {
                     ui.label("Display name:");
                     ui.text_edit_singleline(display_name);
                     ui.label("Role:");
@@ -5200,7 +5467,7 @@ impl eframe::App for RoadmapApp {
                     .map(|m| (m.id, m.display_name.clone()))
                     .collect();
                 let mgr_name = self.org_members.iter().find(|m| m.id == mgr).map(|m| m.display_name.clone()).unwrap_or_default();
-                egui::Window::new(format!("Add Report under {}", mgr_name)).collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new(format!("Add Report under {}", mgr_name)).collapsible(false).resizable(false).show(&ctx, |ui| {
                     ui.label("Select a member to report to this manager:");
                     for user in &candidates {
                         let name = user.1.clone();
@@ -5219,7 +5486,7 @@ impl eframe::App for RoadmapApp {
                 });
             }
             OrgDialogState::JoinOrg { token } => {
-                egui::Window::new("Join Organization").collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Join Organization").collapsible(false).resizable(false).show(&ctx, |ui| {
                     ui.label("User token:");
                     ui.text_edit_singleline(token);
                     ui.horizontal(|ui| {
@@ -5236,7 +5503,7 @@ impl eframe::App for RoadmapApp {
                 });
             }
             OrgDialogState::JoinSharedRoadmap { token } => {
-                egui::Window::new("Open Shared Roadmap").collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Open Shared Roadmap").collapsible(false).resizable(false).show(&ctx, |ui| {
                     ui.label("Share token:");
                     ui.text_edit_singleline(token);
                     ui.horizontal(|ui| {
@@ -5257,7 +5524,7 @@ impl eframe::App for RoadmapApp {
                     .current_roadmap_id
                     .and_then(|rid| self.roadmap_list.iter().find(|(id, _)| *id == rid).map(|(_, n)| n.clone()))
                     .unwrap_or_else(|| "No roadmap selected".to_string());
-                egui::Window::new("Share Current Roadmap").collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Share Current Roadmap").collapsible(false).resizable(false).show(&ctx, |ui| {
                     ui.label(format!("Roadmap: {}", roadmap_name));
                     ui.horizontal(|ui| {
                         if ui.button("Generate Share Token").clicked() {
@@ -5295,7 +5562,7 @@ impl eframe::App for RoadmapApp {
                     .find(|(oid, _, _)| *oid == *org_id)
                     .map(|(_, _, is_owner)| *is_owner)
                     .unwrap_or(false);
-                egui::Window::new("Migrate Organization").collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Migrate Organization").collapsible(false).resizable(false).show(&ctx, |ui| {
                     ui.label("Organization:");
                     egui::ComboBox::from_id_salt("org_migration_select")
                         .selected_text(current_org_name)
@@ -5350,7 +5617,7 @@ impl eframe::App for RoadmapApp {
             OrgDialogState::ConfirmRemoveMember { user_id, display_name } => {
                 let uid = *user_id;
                 let name = display_name.clone();
-                egui::Window::new("Confirm Remove Member").collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Confirm Remove Member").collapsible(false).resizable(false).show(&ctx, |ui| {
                     ui.colored_label(
                         egui::Color32::from_rgb(220, 80, 80),
                         format!("Remove {} from this organization?", name),
@@ -5371,7 +5638,7 @@ impl eframe::App for RoadmapApp {
                 });
             }
             OrgDialogState::ShowToken { title, token } => {
-                egui::Window::new(title.as_str()).collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new(title.as_str()).collapsible(false).resizable(false).show(&ctx, |ui| {
                     ui.label("Copy this token:");
                     ui.add_enabled(false, egui::TextEdit::singleline(token).desired_width(360.0));
                     ui.horizontal(|ui| {
@@ -5394,7 +5661,7 @@ impl eframe::App for RoadmapApp {
                         (org.id, org.name.clone(), db_org_owner_id(&self.db, org.id), settings.mode, sync_state.joined, sync_state.is_owner)
                     })
                     .collect();
-                egui::Window::new("Organization Settings").collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Organization Settings").collapsible(false).resizable(false).show(&ctx, |ui| {
                     ui.label("Organization:");
                     egui::ComboBox::from_id_salt("org_settings_select")
                         .selected_text(name.as_str())
@@ -5671,7 +5938,7 @@ impl eframe::App for RoadmapApp {
                 NetworkSettingsView::Server => "Server Settings",
                 NetworkSettingsView::Proxy => "Proxy Settings",
             };
-            egui::Window::new(title).collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Window::new(title).collapsible(false).resizable(false).show(&ctx, |ui| {
                 match self.network_settings_view {
                     NetworkSettingsView::Server => {
                         let mut scheme = if self.network_edit_config.server_url.starts_with("wss://") {
@@ -5796,7 +6063,7 @@ impl eframe::App for RoadmapApp {
             egui::Window::new("Organization Migrated")
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     ui.label("This organization has migrated to a new server.");
                     ui.label(format!("New server: {}", url));
                     ui.separator();
@@ -5853,7 +6120,7 @@ impl eframe::App for RoadmapApp {
             } else {
                 self.org_settings.mode == "flat" || self.org_selected_user_id == owner_id
             };
-            egui::Window::new(format!("Assign Tasks: {}", feature_title)).collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Window::new(format!("Assign Tasks: {}", feature_title)).collapsible(false).resizable(false).show(&ctx, |ui| {
                 if members_snapshot.is_empty() {
                     ui.colored_label(egui::Color32::GRAY, "No org members available.");
                 } else {
@@ -5916,7 +6183,7 @@ impl eframe::App for RoadmapApp {
                     features.push((feature.id.clone(), feature.title.clone()));
                 }
             }
-            egui::Window::new(format!("Assign Tasks to {}", user_name)).collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Window::new(format!("Assign Tasks to {}", user_name)).collapsible(false).resizable(false).show(&ctx, |ui| {
                 if features.is_empty() {
                     ui.colored_label(egui::Color32::GRAY, "No features available.");
                 } else {
@@ -5978,7 +6245,7 @@ impl eframe::App for RoadmapApp {
         if self.show_org_list_dialog {
             let mut switch_id = None;
             let mut delete_id = None;
-            egui::Window::new("Organizations").collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Window::new("Organizations").collapsible(false).resizable(false).show(&ctx, |ui| {
                 if self.org_list.is_empty() {
                     ui.label("No organizations.");
                 }
@@ -6041,7 +6308,7 @@ impl eframe::App for RoadmapApp {
         if self.show_open_dialog {
             let mut open_id = None;
             let mut delete_id = None;
-            egui::Window::new("Open Roadmap").collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Window::new("Open Roadmap").collapsible(false).resizable(false).show(&ctx, |ui| {
                 if self.roadmap_list.is_empty() {
                     ui.label("No roadmaps found.");
                 }
@@ -6075,7 +6342,7 @@ impl eframe::App for RoadmapApp {
         }
 
         if self.show_new_dialog {
-            egui::Window::new("New Roadmap").collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Window::new("New Roadmap").collapsible(false).resizable(false).show(&ctx, |ui| {
                 ui.label("Roadmap name:");
                 ui.text_edit_singleline(&mut self.new_roadmap_name);
                 ui.horizontal(|ui| {
@@ -6091,7 +6358,7 @@ impl eframe::App for RoadmapApp {
         }
 
         if let Some(rid) = self.rename_roadmap_id {
-            egui::Window::new("Rename Roadmap").collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Window::new("Rename Roadmap").collapsible(false).resizable(false).show(&ctx, |ui| {
                 ui.label("New name:");
                 ui.text_edit_singleline(&mut self.rename_roadmap_name);
                 ui.horizontal(|ui| {
@@ -6114,7 +6381,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 700.0])
-            .with_title("allroads v2.0.2")
+            .with_title("allroads")
             .with_decorations(false)
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../icon.icns"))
