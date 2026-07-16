@@ -1,13 +1,3 @@
-**allroads sync server is here!**
-- allroads client is now network-capable
-- sync with your friends, build orgs, assign tasks
-- option to self-host with easy migration built-in
-- default server is `wss://obsidian.st:59901`
-
-find the sync server source code here: [allroads-sync](https://github.com/vertigo-z/allroads-sync)
-
----
-
 <img align="center" width="100%" height="100%" src="img/allroads.png" alt="allroads interface">
 <img align="center" width="100%" height="100%" src="img/timeline.png" alt="allroads timeline">
 <img align="center" width="100%" height="100%" src="img/org-chart.png" alt="allroads org chart">
