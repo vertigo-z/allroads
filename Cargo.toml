@@ -1,6 +1,6 @@
 [package]
 name = "allroads"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2024"
 description = "a collaborative rust-based roadmap viewer and project management tool"
 license = "MIT"
@@ -34,10 +34,10 @@ lto = true
 debug = false
 
 [package.metadata.bundle]
-name = "Allroads"
+name = "AllRoads"
 identifier = "com.vertigo.allroads.app"
 icon = ["icon.icns"]
-version = "2.1.0"
+version = "2.1.1"
 category = "Productivity"
 short_description = "roadmap planning tool"
 long_description = "a rust-based roadmap viewer and project management tool"
