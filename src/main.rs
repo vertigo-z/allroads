@@ -3610,7 +3610,7 @@ impl eframe::App for RoadmapApp {
             ui.horizontal(|ui| {
                 ui.label(&self.status_text);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.colored_label(egui::Color32::GRAY, "v2.1.0");
+                    ui.colored_label(egui::Color32::GRAY, "v2.1.1");
                 });
             });
         });
@@ -3832,19 +3832,12 @@ impl eframe::App for RoadmapApp {
 
                                                     let status_color = match feature.status.as_str() {
                                                         "Completed" => egui::Color32::from_rgb(76, 175, 80),
-                                                        "Developing" => egui::Color32::from_rgb(0, 188, 212),
-                                                        "Testing" => egui::Color32::from_rgb(138, 43, 226),
-                                                        "Planned" => egui::Color32::from_rgb(180, 180, 180),
-                                                        "Stalled" => egui::Color32::from_rgb(255, 152, 0),
-                                                        "Paused" => egui::Color32::from_rgb(156, 39, 176),
-                                                        "Cancelled" => egui::Color32::from_rgb(244, 67, 54),
-                                                        "Deferred" => egui::Color32::from_rgb(121, 85, 72),
                                                         _ => egui::Color32::from_rgb(180, 180, 180),
                                                     };
                                                     let status_text: egui::RichText = if feature.status == "Completed" {
                                                         egui::RichText::new("\u{2714}")
                                                     } else {
-                                                        egui::RichText::new(format!("[{}]", feature.status))
+                                                        egui::RichText::new(format!("{}", feature.status))
                                                     };
                                                     ui.colored_label(status_color, status_text);
 
@@ -3964,7 +3957,7 @@ impl eframe::App for RoadmapApp {
                                                                         let subtask_text: egui::RichText = if subtask.status == "Completed" {
                                                                             egui::RichText::new("\u{2714}")
                                                                         } else {
-                                                                            egui::RichText::new(format!("[{}]", subtask.status))
+                                                                            egui::RichText::new(format!("{}", subtask.status))
                                                                         };
                                                                         ui.colored_label(subtask_status_color, subtask_text);
                                                                         if !subtask.description.trim().is_empty() {
