@@ -5,7 +5,7 @@
 ---
 # allroads
 
-latest working version. 
+allroads is in beta. 
 <br/>
 <sup>now rewritten in rust.</sup>
 
